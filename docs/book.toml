@@ -1,0 +1,26 @@
+[book]
+title = "franka-rs"
+description = "Idiomatic Rust interface for the Franka Research 3 robot"
+authors = ["Cole Ten"]
+language = "en"
+
+[build]
+build-dir = "../docs"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/cten-ucla/franka-rs"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+additional-css = ["mermaid.css"]
+no-section-label = false
+
+[output.html.search]
+enable = true
+limit-results = 30
+teaser-word-count = 30
+boost-title = 2
+boost-hierarchy = 1
+boost-paragraph = 1
+expand = true
+heading-split-level = 3

@@ -1,0 +1,10 @@
+[package]
+name = "franka-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitflags = "2"
+nalgebra = "0.33"
+socket2 = "0.5"
+thiserror = "2"
