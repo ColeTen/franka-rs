@@ -233,7 +233,3 @@ Requires **Franka Control Interface (FCI)** firmware. The robot must be in FCI m
 | [thiserror](https://crates.io/crates/thiserror) | Derive macros for error types |
 | [bitflags](https://crates.io/crates/bitflags) | Robot error flag representation |
 | [socket2](https://crates.io/crates/socket2) | Low-level TCP/UDP socket control |
-
-## License
-
-TBD
