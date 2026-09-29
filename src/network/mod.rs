@@ -5,9 +5,10 @@ mod handshake;
 pub use command::RobotCommand;
 pub use handshake::{connect_gripper, connect_robot, connect_vacuum_gripper};
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpStream, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 
 use socket2::{SockRef, TcpKeepalive};
@@ -48,6 +49,15 @@ pub struct Network {
     tcp: TcpStream,
     udp: UdpSocket,
     udp_port: u16,
+    /// The robot's IP address. UDP datagrams from any other source are ignored so that a
+    /// stray or hostile host cannot redirect outgoing control commands.
+    robot_ip: IpAddr,
+    /// Source address of the most recent UDP datagram from the robot.
+    ///
+    /// The robot streams state from an ephemeral port, not the command port, so the
+    /// socket is left unconnected and outgoing datagrams are sent back to whichever
+    /// address the incoming state arrived from. `None` until the first datagram is received.
+    udp_peer: Cell<Option<SocketAddr>>,
     next_command_id: u32,
     framing: TcpFraming,
     received_responses: HashMap<u32, Vec<u8>>,
@@ -57,13 +67,11 @@ impl Network {
     /// Connect to a robot at the given address and port.
     pub fn connect(address: &str, port: u16, config: &NetworkConfig) -> FrankaResult<Self> {
         let tcp_addr = format!("{address}:{port}");
-        let tcp = TcpStream::connect_timeout(
-            &tcp_addr.parse().map_err(|e| {
-                FrankaError::network(format!("invalid address '{tcp_addr}': {e}"))
-            })?,
-            config.tcp_timeout,
-        )
-        .map_err(|e| FrankaError::network_with_source(format!("TCP connect to {tcp_addr}"), e))?;
+        let robot_addr: SocketAddr = tcp_addr
+            .parse()
+            .map_err(|e| FrankaError::network(format!("invalid address '{tcp_addr}': {e}")))?;
+        let tcp = TcpStream::connect_timeout(&robot_addr, config.tcp_timeout)
+            .map_err(|e| FrankaError::network_with_source(format!("TCP connect to {tcp_addr}"), e))?;
 
         tcp.set_read_timeout(Some(config.tcp_timeout))
             .map_err(|e| FrankaError::network_with_source("set TCP read timeout", e))?;
@@ -82,16 +90,18 @@ impl Network {
                 .map_err(|e| FrankaError::network_with_source("set TCP keepalive", e))?;
         }
 
-        // Bind UDP socket to any available port.
-        let udp = UdpSocket::bind("0.0.0.0:0")
+        // Bind UDP socket to any available port, matching the robot's address family so
+        // that IPv6 robots work too. The socket is intentionally left unconnected: the
+        // robot streams state from an ephemeral source port rather than the command port,
+        // so a connected socket would drop every state datagram.
+        let udp_bind_addr = match robot_addr.ip() {
+            IpAddr::V4(_) => "0.0.0.0:0",
+            IpAddr::V6(_) => "[::]:0",
+        };
+        let udp = UdpSocket::bind(udp_bind_addr)
             .map_err(|e| FrankaError::network_with_source("bind UDP socket", e))?;
         udp.set_read_timeout(Some(config.udp_timeout))
             .map_err(|e| FrankaError::network_with_source("set UDP read timeout", e))?;
-
-        // Connect UDP to the robot's address so we can use send/recv instead of send_to/recv_from.
-        let udp_target = format!("{address}:{port}");
-        udp.connect(&udp_target)
-            .map_err(|e| FrankaError::network_with_source("connect UDP socket", e))?;
 
         let udp_port = udp
             .local_addr()
@@ -102,6 +112,8 @@ impl Network {
             tcp,
             udp,
             udp_port,
+            robot_ip: robot_addr.ip(),
+            udp_peer: Cell::new(None),
             next_command_id: 0,
             framing: TcpFraming::new(),
             received_responses: HashMap::new(),
@@ -171,38 +183,61 @@ impl Network {
         }
     }
 
-    /// Send data over UDP.
+    /// Send data over UDP to the robot's last known state-stream address.
+    ///
+    /// Requires at least one datagram to have been received first (via
+    /// `udp_blocking_receive` or `udp_try_receive`) so the destination address is known;
+    /// returns an error otherwise.
     pub fn udp_send(&self, data: &[u8]) -> FrankaResult<()> {
-        let sent = self
-            .udp
-            .send(data)
+        let peer = self.udp_peer.get().ok_or_else(|| {
+            FrankaError::network("UDP send attempted before any state datagram was received")
+        })?;
+        self.udp
+            .send_to(data, peer)
             .map_err(|e| FrankaError::network_with_source("UDP send", e))?;
-        if sent != data.len() {
-            return Err(FrankaError::network(format!(
-                "UDP send: sent {sent} bytes, expected {}",
-                data.len()
-            )));
-        }
         Ok(())
     }
 
-    /// Blocking receive from UDP. Returns the received bytes.
+    /// Blocking receive from UDP. Returns the number of bytes received and records the
+    /// sender's address for subsequent `udp_send` calls. Datagrams from any host other
+    /// than the robot are discarded.
     pub fn udp_blocking_receive(&self, buf: &mut [u8]) -> FrankaResult<usize> {
-        let received = self
-            .udp
-            .recv(buf)
-            .map_err(|e| FrankaError::network_with_source("UDP receive", e))?;
-        Ok(received)
+        loop {
+            let (received, peer) = self
+                .udp
+                .recv_from(buf)
+                .map_err(|e| FrankaError::network_with_source("UDP receive", e))?;
+            if peer.ip() != self.robot_ip {
+                continue;
+            }
+            self.udp_peer.set(Some(peer));
+            return Ok(received);
+        }
     }
 
-    /// Non-blocking receive from UDP. Returns None if no data available.
+    /// Non-blocking receive from UDP. Returns None if no data available. On success,
+    /// records the sender's address for subsequent `udp_send` calls. Datagrams from any
+    /// host other than the robot are discarded.
     pub fn udp_try_receive(&self, buf: &mut [u8]) -> FrankaResult<Option<usize>> {
-        self.udp.set_nonblocking(true).ok();
-        let result = self.udp.recv(buf);
-        self.udp.set_nonblocking(false).ok();
+        self.udp
+            .set_nonblocking(true)
+            .map_err(|e| FrankaError::network_with_source("set UDP non-blocking", e))?;
+        let result = loop {
+            match self.udp.recv_from(buf) {
+                Ok((n, peer)) if peer.ip() == self.robot_ip => break Ok((n, peer)),
+                Ok(_) => continue,
+                Err(e) => break Err(e),
+            }
+        };
+        self.udp
+            .set_nonblocking(false)
+            .map_err(|e| FrankaError::network_with_source("restore UDP blocking", e))?;
 
         match result {
-            Ok(n) => Ok(Some(n)),
+            Ok((n, peer)) => {
+                self.udp_peer.set(Some(peer));
+                Ok(Some(n))
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(FrankaError::network_with_source("UDP receive", e)),
         }

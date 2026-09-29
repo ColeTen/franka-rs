@@ -40,7 +40,7 @@ impl Robot {
     ///
     /// Performs the TCP connection and protocol version handshake.
     pub fn connect(address: &str) -> FrankaResult<Self> {
-        Self::connect_with_config(address, RealtimeConfig::Enforce)
+        Self::connect_with_config(address, RealtimeConfig::Ignore)
     }
 
     /// Connect with explicit realtime configuration.
@@ -76,6 +76,7 @@ impl Robot {
     /// Blocks until a state packet is received.
     pub fn read_once(&self) -> FrankaResult<RobotState> {
         let mut buf = [0u8; RawRobotState::SIZE + 128];
+
         let n = self.network.udp_blocking_receive(&mut buf)?;
 
         if n < RawRobotState::SIZE {
