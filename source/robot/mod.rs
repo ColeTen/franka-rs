@@ -7,6 +7,7 @@ use crate::control_loop;
 use crate::control_types::{MotionResult, MotionType};
 use crate::errors::{FrankaError, FrankaResult};
 use crate::logging::LogEntry;
+use crate::model::Model;
 use crate::network::{self, Network, NetworkConfig};
 use crate::robot_state::RobotState;
 use crate::types::{
@@ -325,6 +326,11 @@ impl Robot {
     pub fn get_robot_model(&mut self) -> FrankaResult<String> {
         let mut cmd = network::RobotCommand::new(&mut self.network);
         cmd.get_robot_model()
+    }
+
+    /// Request the robot model URDF and build a kinematic and dynamic model from it.
+    pub fn load_model(&mut self) -> FrankaResult<Model> {
+        Model::from_urdf(&self.get_robot_model()?)
     }
 
     // === Active Control (non-callback interface) ===

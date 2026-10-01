@@ -1,4 +1,7 @@
+use nalgebra::{Matrix3, Vector3};
+
 use crate::errors::RobotErrors;
+use crate::model::RigidBodyInertia;
 use crate::types::{MotionGeneratorMode, RobotMode};
 
 /// Complete robot state received from the robot at each control cycle.
@@ -143,3 +146,25 @@ pub struct RobotState {
     pub time: std::time::Duration,
 }
 
+impl RobotState {
+    /// Returns the combined inertia of the configured end effector and external load,
+    /// expressed in the flange frame.
+    ///
+    /// A body configured with zero mass contributes nothing, whatever its configured inertia.
+    pub fn total_load(&self) -> RigidBodyInertia {
+        configured_body(self.m_ee, &self.f_x_cee, &self.i_ee)
+            .combine(&configured_body(self.m_load, &self.f_x_cload, &self.i_load))
+    }
+}
+
+/// Returns the inertia of a configured body, or zero inertia if its mass is zero.
+fn configured_body(mass: f64, center_of_mass: &[f64; 3], rotational_inertia: &[f64; 9]) -> RigidBodyInertia {
+    if mass == 0.0 {
+        return RigidBodyInertia::zero();
+    }
+    RigidBodyInertia::new(
+        mass,
+        Vector3::from(*center_of_mass),
+        Matrix3::from_column_slice(rotational_inertia),
+    )
+}
