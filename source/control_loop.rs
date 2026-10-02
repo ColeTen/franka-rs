@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::constants::DELTA_T;
 use crate::control_types::{is_finished, motion_value, MotionResult, MotionType};
 use crate::errors::{FrankaError, FrankaResult};
+use crate::joint_velocity_limits::JointVelocityLimits;
 use crate::logging::Logger;
 use crate::lowpass_filter::{self, MAX_CUTOFF_FREQUENCY};
 use crate::network::Network;
@@ -47,6 +48,7 @@ pub fn run_motion_loop<M, F>(
     network: &mut Network,
     controller_mode: ControllerMode,
     config: &ControlLoopConfig,
+    joint_velocity_limits: &JointVelocityLimits,
     mut motion_callback: F,
 ) -> FrankaResult<Vec<crate::logging::LogEntry>>
 where
@@ -62,6 +64,7 @@ where
         network,
         motion_id,
         config,
+        joint_velocity_limits,
         &mut motion_callback,
         &mut logger,
         &mut filter_state,
@@ -86,6 +89,7 @@ where
 pub fn run_motion_with_control_loop<M, MF, CF>(
     network: &mut Network,
     config: &ControlLoopConfig,
+    joint_velocity_limits: &JointVelocityLimits,
     mut motion_callback: MF,
     mut control_callback: CF,
 ) -> FrankaResult<Vec<crate::logging::LogEntry>>
@@ -107,6 +111,7 @@ where
         network,
         motion_id,
         config,
+        joint_velocity_limits,
         &mut motion_callback,
         &mut control_callback,
         &mut logger,
@@ -163,6 +168,7 @@ fn motion_loop_inner<M, F>(
     network: &mut Network,
     motion_id: u32,
     config: &ControlLoopConfig,
+    joint_velocity_limits: &JointVelocityLimits,
     motion_callback: &mut F,
     logger: &mut Logger,
     filter_state: &mut FilterState,
@@ -180,12 +186,12 @@ where
         let time_step = state.time.saturating_sub(previous_time);
         let motion_result = motion_callback(&state, time_step);
         let motion_command =
-            process_motion_command(&motion_result, &state, config, filter_state)?;
+            process_motion_command(&motion_result, &state, config, joint_velocity_limits, filter_state)?;
 
         let finished = is_finished(&motion_result);
 
         let robot_cmd = build_robot_command(
-            0, // message_id set by caller in real implementation
+            network.latest_state_message_id(),
             Some(&motion_command),
             None,
             finished,
@@ -210,6 +216,7 @@ fn combined_loop_inner<M, MF, CF>(
     network: &mut Network,
     motion_id: u32,
     config: &ControlLoopConfig,
+    joint_velocity_limits: &JointVelocityLimits,
     motion_callback: &mut MF,
     control_callback: &mut CF,
     logger: &mut Logger,
@@ -233,14 +240,14 @@ where
 
         let motion_result = motion_callback(&state, time_step);
         let motion_command =
-            process_motion_command(&motion_result, &state, config, filter_state)?;
+            process_motion_command(&motion_result, &state, config, joint_velocity_limits, filter_state)?;
 
         let motion_finished = is_finished(&motion_result);
         let control_finished = is_finished(&control_result);
         let finished = motion_finished || control_finished;
 
         let robot_cmd = build_robot_command(
-            0,
+            network.latest_state_message_id(),
             Some(&motion_command),
             Some(&control_command),
             motion_finished,
@@ -283,7 +290,13 @@ where
 
         let finished = is_finished(&control_result);
 
-        let robot_cmd = build_robot_command(0, None, Some(&control_command), false, finished);
+        let robot_cmd = build_robot_command(
+            network.latest_state_message_id(),
+            None,
+            Some(&control_command),
+            false,
+            finished,
+        );
 
         logger.log(state.clone(), Some(robot_cmd));
 
@@ -315,6 +328,7 @@ fn process_motion_command<M: MotionType>(
     result: &MotionResult<M>,
     state: &RobotState,
     config: &ControlLoopConfig,
+    joint_velocity_limits: &JointVelocityLimits,
     filter_state: &mut FilterState,
 ) -> FrankaResult<MotionGeneratorCommand> {
     let motion = motion_value(result);
@@ -328,7 +342,7 @@ fn process_motion_command<M: MotionType>(
         motion_generation_finished: 0,
     };
 
-    convert_motion(&motion, state, config, filter_state, &mut cmd)?;
+    convert_motion(&motion, state, config, joint_velocity_limits, filter_state, &mut cmd)?;
     Ok(cmd)
 }
 
@@ -367,16 +381,17 @@ fn convert_motion<M: MotionType>(
     motion: &M,
     state: &RobotState,
     config: &ControlLoopConfig,
+    joint_velocity_limits: &JointVelocityLimits,
     filter_state: &mut FilterState,
     cmd: &mut MotionGeneratorCommand,
 ) -> FrankaResult<()> {
     let mode = M::motion_generator_mode();
     match mode {
         MotionGeneratorMode::JointPosition => {
-            convert_joint_positions(motion, state, config, filter_state, cmd)
+            convert_joint_positions(motion, state, config, joint_velocity_limits, filter_state, cmd)
         }
         MotionGeneratorMode::JointVelocity => {
-            convert_joint_velocities(motion, state, config, cmd)
+            convert_joint_velocities(motion, state, config, joint_velocity_limits, cmd)
         }
         MotionGeneratorMode::CartesianPosition => {
             convert_cartesian_pose(motion, state, config, filter_state, cmd)
@@ -394,6 +409,7 @@ fn convert_joint_positions<M: MotionType>(
     motion: &M,
     state: &RobotState,
     config: &ControlLoopConfig,
+    joint_velocity_limits: &JointVelocityLimits,
     filter_state: &mut FilterState,
     cmd: &mut MotionGeneratorCommand,
 ) -> FrankaResult<()> {
@@ -419,8 +435,8 @@ fn convert_joint_positions<M: MotionType>(
 
     if config.limit_rate {
         q_c = rate_limiting::limit_rate_joint_positions(
-            &rate_limiting::MAX_JOINT_ACCELERATION,
-            &rate_limiting::MAX_JOINT_ACCELERATION,
+            &joint_velocity_limits.upper(&reference),
+            &joint_velocity_limits.lower(&reference),
             &rate_limiting::MAX_JOINT_ACCELERATION,
             &rate_limiting::MAX_JOINT_JERK,
             &q_c,
@@ -439,6 +455,7 @@ fn convert_joint_velocities<M: MotionType>(
     motion: &M,
     state: &RobotState,
     config: &ControlLoopConfig,
+    joint_velocity_limits: &JointVelocityLimits,
     cmd: &mut MotionGeneratorCommand,
 ) -> FrankaResult<()> {
     let velocities: &JointVelocities =
@@ -456,8 +473,8 @@ fn convert_joint_velocities<M: MotionType>(
 
     if config.limit_rate {
         dq_c = rate_limiting::limit_rate_joint_velocities(
-            &rate_limiting::MAX_JOINT_ACCELERATION,
-            &rate_limiting::MAX_JOINT_ACCELERATION,
+            &joint_velocity_limits.upper(&state.q_d),
+            &joint_velocity_limits.lower(&state.q_d),
             &rate_limiting::MAX_JOINT_ACCELERATION,
             &rate_limiting::MAX_JOINT_JERK,
             &dq_c,
@@ -687,21 +704,66 @@ fn cancel_motion(network: &mut Network, _motion_id: u32) -> FrankaResult<()> {
     Ok(())
 }
 
-fn receive_robot_state(network: &Network) -> FrankaResult<RobotState> {
-    let mut buf = [0u8; RawRobotState::SIZE + 128];
-    let n = network.udp_blocking_receive(&mut buf)?;
+/// Returns the newest robot state whose message ID is greater than the last one recorded on
+/// `network`, and records its ID.
+///
+/// States already queued on the socket are drained and the newest is kept; if none is newer than
+/// the last recorded state, blocks until one arrives.
+///
+/// # Errors
+/// Returns [`FrankaError::Protocol`] if a received datagram is not exactly the size of a robot
+/// state, and [`FrankaError::Network`] if receiving fails or no datagram arrives within the
+/// network's UDP timeout.
+pub(crate) fn receive_robot_state(network: &Network) -> FrankaResult<RobotState> {
+    let last_message_id = network.latest_state_message_id();
+    let mut newest: Option<RawRobotState> = None;
+    // One byte larger than a state, so an oversized datagram shows up as a wrong length instead
+    // of being truncated to a valid-looking state.
+    let mut buf = [0u8; RawRobotState::SIZE + 1];
 
-    if n < RawRobotState::SIZE {
+    while let Some(n) = network.udp_try_receive(&mut buf)? {
+        newest = newer_state(newest, last_message_id, decode_robot_state(&buf[..n])?);
+    }
+    while newest.is_none() {
+        let n = network.udp_blocking_receive(&mut buf)?;
+        newest = newer_state(newest, last_message_id, decode_robot_state(&buf[..n])?);
+    }
+
+    let raw = newest.expect("loop exits only once a newer state is kept");
+    network.record_state_message_id(raw.message_id);
+    Ok(raw.to_robot_state())
+}
+
+/// Returns `candidate` if its message ID exceeds that of `newest` (or `last_message_id` when there
+/// is no `newest` yet), and `newest` otherwise.
+fn newer_state(
+    newest: Option<RawRobotState>,
+    last_message_id: u64,
+    candidate: RawRobotState,
+) -> Option<RawRobotState> {
+    let newest_message_id = newest.map_or(last_message_id, |state| state.message_id);
+    if candidate.message_id > newest_message_id {
+        Some(candidate)
+    } else {
+        newest
+    }
+}
+
+/// Decodes one UDP datagram as a robot state.
+///
+/// # Errors
+/// Returns [`FrankaError::Protocol`] if `datagram` is not exactly the size of a robot state.
+fn decode_robot_state(datagram: &[u8]) -> FrankaResult<RawRobotState> {
+    if datagram.len() != RawRobotState::SIZE {
         return Err(FrankaError::Protocol {
             message: format!(
-                "UDP state packet too small: got {n} bytes, expected at least {}",
+                "UDP state packet has wrong size: got {} bytes, expected {}",
+                datagram.len(),
                 RawRobotState::SIZE
             ),
         });
     }
-
-    let raw = unsafe { RawRobotState::from_bytes(&buf[..n]) };
-    Ok(raw.to_robot_state())
+    Ok(unsafe { RawRobotState::from_bytes(datagram) })
 }
 
 fn send_robot_command(network: &Network, cmd: &RobotCommand) -> FrankaResult<()> {
@@ -790,4 +852,96 @@ fn struct_to_bytes<T: Copy>(value: &T) -> Vec<u8> {
         std::ptr::copy_nonoverlapping(value as *const T as *const u8, bytes.as_mut_ptr(), size);
     }
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{TcpListener, UdpSocket};
+    use std::thread;
+
+    use super::*;
+    use crate::network::NetworkConfig;
+
+    /// Connects a `Network` to a local accept-only TCP listener, and returns it with a UDP socket
+    /// that stands in for the robot's state stream.
+    fn connect_local() -> (Network, UdpSocket, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let tcp_server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_secs(1));
+            drop(stream);
+        });
+        let config = NetworkConfig {
+            udp_timeout: Duration::from_secs(1),
+            keepalive_enabled: false,
+            ..Default::default()
+        };
+        let network = Network::connect("127.0.0.1", port, &config).unwrap();
+        (network, UdpSocket::bind("127.0.0.1:0").unwrap(), tcp_server)
+    }
+
+    /// Sends a robot state datagram carrying `message_id` to `network`.
+    fn send_state(robot: &UdpSocket, network: &Network, message_id: u64) {
+        let mut datagram = vec![0u8; RawRobotState::SIZE];
+        datagram[0..8].copy_from_slice(&message_id.to_ne_bytes());
+        robot.send_to(&datagram, ("127.0.0.1", network.udp_port())).unwrap();
+    }
+
+    #[test]
+    fn receive_robot_state_returns_newest_queued_state() {
+        let (network, robot, tcp_server) = connect_local();
+        for message_id in [5, 7, 6] {
+            send_state(&robot, &network, message_id);
+        }
+        thread::sleep(Duration::from_millis(50));
+
+        let state = receive_robot_state(&network).unwrap();
+        assert_eq!(state.time, Duration::from_millis(7));
+        assert_eq!(network.latest_state_message_id(), 7);
+        tcp_server.join().unwrap();
+    }
+
+    #[test]
+    fn receive_robot_state_skips_states_not_newer_than_last() {
+        let (network, robot, tcp_server) = connect_local();
+        send_state(&robot, &network, 7);
+        thread::sleep(Duration::from_millis(50));
+        receive_robot_state(&network).unwrap();
+
+        // Only stale states are queued, so the call must wait for the newer one sent later.
+        send_state(&robot, &network, 7);
+        send_state(&robot, &network, 4);
+        let late_sender = thread::spawn({
+            let robot = robot.try_clone().unwrap();
+            let udp_port = network.udp_port();
+            move || {
+                thread::sleep(Duration::from_millis(100));
+                let mut datagram = vec![0u8; RawRobotState::SIZE];
+                datagram[0..8].copy_from_slice(&10u64.to_ne_bytes());
+                robot.send_to(&datagram, ("127.0.0.1", udp_port)).unwrap();
+            }
+        });
+
+        let state = receive_robot_state(&network).unwrap();
+        assert_eq!(state.time, Duration::from_millis(10));
+        assert_eq!(network.latest_state_message_id(), 10);
+        late_sender.join().unwrap();
+        tcp_server.join().unwrap();
+    }
+
+    #[test]
+    fn receive_robot_state_rejects_too_small_packet() {
+        let (network, robot, tcp_server) = connect_local();
+        let datagram = vec![0u8; RawRobotState::SIZE - 1];
+        robot.send_to(&datagram, ("127.0.0.1", network.udp_port())).unwrap();
+
+        let result = receive_robot_state(&network);
+        assert!(
+            matches!(&result, Err(FrankaError::Protocol { message }) if message.contains("wrong size")),
+            "{result:?}"
+        );
+        assert_eq!(network.latest_state_message_id(), 0);
+        tcp_server.join().unwrap();
+    }
 }

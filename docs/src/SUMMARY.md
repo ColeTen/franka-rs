@@ -31,3 +31,7 @@
 - [Comparison with libfranka C++](./design/comparison.md)
 - [Real-Time Considerations](./design/realtime.md)
 - [Safety & Error Recovery](./design/safety.md)
+
+# Validation
+
+- [Live Network Comparison](./validation/live-capture.md)

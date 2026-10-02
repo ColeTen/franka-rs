@@ -46,6 +46,9 @@ pub const MAX_JOINT_ACCELERATION: [f64; 7] = [
     10.0 - LIMIT_EPS,
 ];
 
+/// Margin in rad/s by which joint velocity limits are tightened, to absorb numerical errors.
+pub const JOINT_VELOCITY_LIMITS_TOLERANCE: [f64; 7] = [LIMIT_EPS; 7];
+
 /// Maximum translational jerk in m/s^3.
 pub const MAX_TRANSLATIONAL_JERK: f64 = 4500.0 - LIMIT_EPS;
 
@@ -117,9 +120,11 @@ pub fn limit_rate_velocity(
         * (lower_limit - last_commanded_velocity))
         .max(-max_acceleration);
 
-    // Limit acceleration and integrate to get velocity
+    // Limit acceleration and integrate to get velocity. The bounds can cross when the last velocity
+    // already exceeds a velocity limit; applying the upper bound first and the lower bound last
+    // then yields the lower bound (and `f64::clamp` would panic).
     last_commanded_velocity
-        + commanded_acceleration.clamp(safe_min_acceleration, safe_max_acceleration) * DELTA_T
+        + commanded_acceleration.min(safe_max_acceleration).max(safe_min_acceleration) * DELTA_T
 }
 
 /// Limit the rate of a single joint position value.
@@ -391,6 +396,14 @@ mod tests {
         for i in 0..7 {
             assert!((result[i] - values[i]).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn limit_rate_velocity_decelerates_when_last_velocity_exceeds_upper_limit() {
+        // Last velocity 0.1 is above the upper limit 0.0, so the acceleration bounds cross
+        // (safe max -50, safe min -10); the result decelerates at the lower bound.
+        let result = limit_rate_velocity(0.0, -1.0, 10.0, 5000.0, 0.1, 0.1, 0.0);
+        assert!((result - (0.1 - 10.0 * DELTA_T)).abs() < 1e-12);
     }
 
     #[test]

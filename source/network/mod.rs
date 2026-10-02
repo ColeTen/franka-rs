@@ -58,6 +58,9 @@ pub struct Network {
     /// socket is left unconnected and outgoing datagrams are sent back to whichever
     /// address the incoming state arrived from. `None` until the first datagram is received.
     udp_peer: Cell<Option<SocketAddr>>,
+    /// Message ID of the most recently received robot state. Outgoing robot commands carry this
+    /// ID so the robot can match each command to the state it answers. Zero until a state arrives.
+    latest_state_message_id: Cell<u64>,
     next_command_id: u32,
     framing: TcpFraming,
     received_responses: HashMap<u32, Vec<u8>>,
@@ -114,6 +117,7 @@ impl Network {
             udp_port,
             robot_ip: robot_addr.ip(),
             udp_peer: Cell::new(None),
+            latest_state_message_id: Cell::new(0),
             next_command_id: 0,
             framing: TcpFraming::new(),
             received_responses: HashMap::new(),
@@ -123,6 +127,16 @@ impl Network {
     /// Returns the local UDP port that the robot should send state to.
     pub fn udp_port(&self) -> u16 {
         self.udp_port
+    }
+
+    /// Returns the message ID of the most recently received robot state (zero if none yet).
+    pub(crate) fn latest_state_message_id(&self) -> u64 {
+        self.latest_state_message_id.get()
+    }
+
+    /// Records `message_id` as the ID of the most recently received robot state.
+    pub(crate) fn record_state_message_id(&self, message_id: u64) {
+        self.latest_state_message_id.set(message_id);
     }
 
     /// Send a TCP request and return the assigned command ID.
@@ -137,16 +151,13 @@ impl Network {
             size: total_size,
         };
 
-        let header_bytes = header.to_bytes();
+        // Header and payload go out in one write so the request leaves as a single segment.
+        let mut message = Vec::with_capacity(total_size as usize);
+        message.extend_from_slice(&header.to_bytes());
+        message.extend_from_slice(payload);
         self.tcp
-            .write_all(&header_bytes)
-            .map_err(|e| FrankaError::network_with_source("TCP send header", e))?;
-
-        if !payload.is_empty() {
-            self.tcp
-                .write_all(payload)
-                .map_err(|e| FrankaError::network_with_source("TCP send payload", e))?;
-        }
+            .write_all(&message)
+            .map_err(|e| FrankaError::network_with_source("TCP send request", e))?;
 
         Ok(command_id)
     }

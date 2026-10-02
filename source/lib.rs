@@ -4,6 +4,7 @@ pub mod control_loop;
 pub mod control_types;
 pub mod errors;
 pub mod gripper;
+pub mod joint_velocity_limits;
 pub mod logging;
 pub mod lowpass_filter;
 pub mod model;

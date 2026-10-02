@@ -1,6 +1,7 @@
 //! Tests of [`Model`] against reference values computed for the FR3 URDF.
 
 use std::f64::consts::FRAC_1_SQRT_2;
+use std::path::Path;
 
 use nalgebra::{Isometry3, Matrix3, Matrix4, Translation3, UnitQuaternion, Vector3};
 
@@ -407,9 +408,9 @@ fn model_matches_libfranka() {
         eprintln!("skipping: {path} not present (generate it in the devcontainer via validation/reference/model.cpp)");
         return;
     };
-
-    let urdf = include_str!("../../tests/fixtures/fr3_robot.urdf");
-    let model = Model::from_urdf(urdf).unwrap();
+    let urdf_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("fr3_robot.urdf");
+    let urdf = std::fs::read_to_string(&urdf_path).unwrap();
+    let model = Model::from_urdf(&urdf).unwrap();
     let kinematics_tolerance = 1e-6;
     let dynamics_tolerance = 1e-4;
 

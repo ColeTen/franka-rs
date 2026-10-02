@@ -1,10 +1,10 @@
 use crate::control_loop;
 use crate::control_types::MotionType;
-use crate::errors::{FrankaError, FrankaResult};
+use crate::errors::FrankaResult;
 use crate::network::Network;
 use crate::robot_state::RobotState;
 use crate::types::{ControllerMode, MotionGeneratorMode, Torques};
-use crate::wire::robot::{ControllerCommand, MotionGeneratorCommand, RawRobotState, RobotCommand};
+use crate::wire::robot::{ControllerCommand, MotionGeneratorCommand, RobotCommand};
 
 /// Active torque control session — read state and write torques without a callback.
 ///
@@ -13,7 +13,6 @@ use crate::wire::robot::{ControllerCommand, MotionGeneratorCommand, RawRobotStat
 pub struct ActiveTorqueControl<'a> {
     network: &'a mut Network,
     motion_id: u32,
-    message_id: u64,
     finished: bool,
 }
 
@@ -28,27 +27,13 @@ impl<'a> ActiveTorqueControl<'a> {
         Ok(Self {
             network,
             motion_id,
-            message_id: 0,
             finished: false,
         })
     }
 
     /// Read the latest robot state from the robot.
     pub fn read_state(&self) -> FrankaResult<RobotState> {
-        let mut buf = [0u8; RawRobotState::SIZE + 128];
-        let n = self.network.udp_blocking_receive(&mut buf)?;
-
-        if n < RawRobotState::SIZE {
-            return Err(FrankaError::Protocol {
-                message: format!(
-                    "UDP state too small: {n} < {}",
-                    RawRobotState::SIZE
-                ),
-            });
-        }
-
-        let raw = unsafe { RawRobotState::from_bytes(&buf[..n]) };
-        Ok(raw.to_robot_state())
+        control_loop::receive_robot_state(self.network)
     }
 
     /// Send torque commands to the robot.
@@ -73,12 +58,11 @@ impl<'a> ActiveTorqueControl<'a> {
         };
 
         let robot_cmd = RobotCommand {
-            message_id: self.message_id,
+            message_id: self.network.latest_state_message_id(),
             motion: motion_cmd,
             control: control_cmd,
         };
 
-        self.message_id += 1;
         let bytes = struct_to_bytes(&robot_cmd);
         self.network.udp_send(&bytes)?;
 
@@ -110,7 +94,7 @@ impl<'a> ActiveTorqueControl<'a> {
         };
 
         let robot_cmd = RobotCommand {
-            message_id: self.message_id,
+            message_id: self.network.latest_state_message_id(),
             motion: motion_cmd,
             control: control_cmd,
         };
@@ -137,7 +121,6 @@ impl Drop for ActiveTorqueControl<'_> {
 pub struct ActiveMotionControl<'a, M: MotionType> {
     network: &'a mut Network,
     motion_id: u32,
-    message_id: u64,
     finished: bool,
     _marker: std::marker::PhantomData<M>,
 }
@@ -156,7 +139,6 @@ impl<'a, M: MotionType> ActiveMotionControl<'a, M> {
         Ok(Self {
             network,
             motion_id,
-            message_id: 0,
             finished: false,
             _marker: std::marker::PhantomData,
         })
@@ -164,20 +146,7 @@ impl<'a, M: MotionType> ActiveMotionControl<'a, M> {
 
     /// Read the latest robot state.
     pub fn read_state(&self) -> FrankaResult<RobotState> {
-        let mut buf = [0u8; RawRobotState::SIZE + 128];
-        let n = self.network.udp_blocking_receive(&mut buf)?;
-
-        if n < RawRobotState::SIZE {
-            return Err(FrankaError::Protocol {
-                message: format!(
-                    "UDP state too small: {n} < {}",
-                    RawRobotState::SIZE
-                ),
-            });
-        }
-
-        let raw = unsafe { RawRobotState::from_bytes(&buf[..n]) };
-        Ok(raw.to_robot_state())
+        control_loop::receive_robot_state(self.network)
     }
 
     /// Send a motion command to the robot.
@@ -190,12 +159,11 @@ impl<'a, M: MotionType> ActiveMotionControl<'a, M> {
         };
 
         let robot_cmd = RobotCommand {
-            message_id: self.message_id,
+            message_id: self.network.latest_state_message_id(),
             motion: *command,
             control: control_cmd,
         };
 
-        self.message_id += 1;
         let bytes = struct_to_bytes(&robot_cmd);
         self.network.udp_send(&bytes)?;
 
@@ -215,12 +183,11 @@ impl<'a, M: MotionType> ActiveMotionControl<'a, M> {
         };
 
         let robot_cmd = RobotCommand {
-            message_id: self.message_id,
+            message_id: self.network.latest_state_message_id(),
             motion: *motion,
             control: control_cmd,
         };
 
-        self.message_id += 1;
         let bytes = struct_to_bytes(&robot_cmd);
         self.network.udp_send(&bytes)?;
 
@@ -250,7 +217,7 @@ impl<'a, M: MotionType> ActiveMotionControl<'a, M> {
         };
 
         let robot_cmd = RobotCommand {
-            message_id: self.message_id,
+            message_id: self.network.latest_state_message_id(),
             motion: motion_cmd,
             control: control_cmd,
         };

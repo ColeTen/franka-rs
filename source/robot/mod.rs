@@ -6,6 +6,7 @@ use crate::constants::ROBOT_COMMAND_PORT;
 use crate::control_loop;
 use crate::control_types::{MotionResult, MotionType};
 use crate::errors::{FrankaError, FrankaResult};
+use crate::joint_velocity_limits::JointVelocityLimits;
 use crate::logging::LogEntry;
 use crate::model::Model;
 use crate::network::{self, Network, NetworkConfig};
@@ -15,7 +16,7 @@ use crate::types::{
     RealtimeConfig, Torques,
 };
 use crate::wire::robot::{
-    self, RawRobotState, SetCartesianImpedanceRequest, SetEeToKRequest, SetGuidingModeRequest,
+    self, SetCartesianImpedanceRequest, SetEeToKRequest, SetGuidingModeRequest,
     SetJointImpedanceRequest, SetNeToEeRequest,
 };
 
@@ -34,12 +35,16 @@ pub struct Robot {
     network: Network,
     server_version: u16,
     realtime_config: RealtimeConfig,
+    /// Position-dependent joint velocity limits from the robot's URDF, used to rate-limit
+    /// joint position and joint velocity commands.
+    joint_velocity_limits: JointVelocityLimits,
 }
 
 impl Robot {
     /// Connect to a Franka robot at the given IP address or hostname.
     ///
-    /// Performs the TCP connection and protocol version handshake.
+    /// Performs the TCP connection and protocol version handshake, waits for the first robot
+    /// state, and downloads the robot's URDF to read its joint velocity limits.
     pub fn connect(address: &str) -> FrankaResult<Self> {
         Self::connect_with_config(address, RealtimeConfig::Ignore)
     }
@@ -52,11 +57,20 @@ impl Robot {
         let net_config = NetworkConfig::default();
         let mut network = Network::connect(address, ROBOT_COMMAND_PORT, &net_config)?;
         let server_version = network::connect_robot(&mut network)?;
+        control_loop::receive_robot_state(&network)?;
+        let urdf = network::RobotCommand::new(&mut network).get_robot_model()?;
+        // Mobile robots' URDFs carry no joint velocity limits; they keep the all-zero default.
+        let joint_velocity_limits = if is_mobile_robot_urdf(&urdf) {
+            JointVelocityLimits::default()
+        } else {
+            JointVelocityLimits::from_urdf(&urdf)?
+        };
 
         Ok(Self {
             network,
             server_version,
             realtime_config,
+            joint_velocity_limits,
         })
     }
 
@@ -72,25 +86,12 @@ impl Robot {
 
     // === State Reading ===
 
-    /// Read a single robot state from the UDP stream.
+    /// Read the newest robot state from the UDP stream.
     ///
-    /// Blocks until a state packet is received.
+    /// Returns the newest state already received if it is newer than the last one read;
+    /// otherwise blocks until a newer state arrives.
     pub fn read_once(&self) -> FrankaResult<RobotState> {
-        let mut buf = [0u8; RawRobotState::SIZE + 128];
-
-        let n = self.network.udp_blocking_receive(&mut buf)?;
-
-        if n < RawRobotState::SIZE {
-            return Err(FrankaError::Protocol {
-                message: format!(
-                    "UDP state packet too small: got {n}, expected {}",
-                    RawRobotState::SIZE
-                ),
-            });
-        }
-
-        let raw = unsafe { RawRobotState::from_bytes(&buf[..n]) };
-        Ok(raw.to_robot_state())
+        control_loop::receive_robot_state(&self.network)
     }
 
     /// Continuously read robot state, calling `callback` for each update.
@@ -126,6 +127,7 @@ impl Robot {
             &mut self.network,
             motion_config.controller_mode,
             &motion_config.to_control_loop_config(),
+            &self.joint_velocity_limits,
             callback,
         )
     }
@@ -143,6 +145,7 @@ impl Robot {
             &mut self.network,
             motion_config.controller_mode,
             &motion_config.to_control_loop_config(),
+            &self.joint_velocity_limits,
             callback,
         )
     }
@@ -160,6 +163,7 @@ impl Robot {
             &mut self.network,
             motion_config.controller_mode,
             &motion_config.to_control_loop_config(),
+            &self.joint_velocity_limits,
             callback,
         )
     }
@@ -177,6 +181,7 @@ impl Robot {
             &mut self.network,
             motion_config.controller_mode,
             &motion_config.to_control_loop_config(),
+            &self.joint_velocity_limits,
             callback,
         )
     }
@@ -215,6 +220,7 @@ impl Robot {
         control_loop::run_motion_with_control_loop(
             &mut self.network,
             &motion_config.to_control_loop_config(),
+            &self.joint_velocity_limits,
             motion_callback,
             control_callback,
         )
@@ -353,5 +359,34 @@ impl Robot {
         controller_mode: ControllerMode,
     ) -> FrankaResult<crate::active_control::ActiveMotionControl<'_, M>> {
         crate::active_control::ActiveMotionControl::start(&mut self.network, controller_mode)
+    }
+}
+
+/// Prefix of the `<robot name>` attribute that marks a URDF as describing a mobile robot.
+const MOBILE_ROBOT_NAME_PREFIX: &str = "tmr";
+
+/// Returns whether `urdf` describes a mobile robot: its root `<robot>` element has a `name`
+/// starting with `tmr`. Unparseable documents are not mobile robots.
+fn is_mobile_robot_urdf(urdf: &str) -> bool {
+    let Ok(document) = roxmltree::Document::parse(urdf) else {
+        return false;
+    };
+    let robot = document.root_element();
+    robot.has_tag_name("robot")
+        && robot
+            .attribute("name")
+            .is_some_and(|name| name.starts_with(MOBILE_ROBOT_NAME_PREFIX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mobile_robot_urdf_is_recognised_by_name_prefix() {
+        assert!(is_mobile_robot_urdf(r#"<robot name="tmrv0_2"></robot>"#));
+        assert!(!is_mobile_robot_urdf(include_str!("../../tests/fixtures/fr3_robot.urdf")));
+        assert!(!is_mobile_robot_urdf(r#"<robot></robot>"#));
+        assert!(!is_mobile_robot_urdf("not xml"));
     }
 }
