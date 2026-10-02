@@ -360,3 +360,121 @@ fn from_state_methods_forward_state_fields() {
     assert_eq!(model.coriolis_from_state(&state), JointVector::from(state.dq));
     assert_eq!(model.gravity_from_state(&state)[0], -9.7);
 }
+
+/// Maps the frame index emitted by validation/reference/model.cpp back to a `Frame`.
+fn frame_from_index(index: usize) -> Frame {
+    match index {
+        0 => Frame::Joint1,
+        1 => Frame::Joint2,
+        2 => Frame::Joint3,
+        3 => Frame::Joint4,
+        4 => Frame::Joint5,
+        5 => Frame::Joint6,
+        6 => Frame::Joint7,
+        7 => Frame::Flange,
+        8 => Frame::EndEffector,
+        9 => Frame::Stiffness,
+        other => panic!("invalid frame index {other}"),
+    }
+}
+
+/// Builds an isometry from a column-major 4x4 transform.
+fn isometry_from_columns(columns: &[f64]) -> Isometry3<f64> {
+    let matrix: [f64; 16] = columns.try_into().expect("16 values");
+    crate::types::CartesianPose::from_column_major(&matrix).inner
+}
+
+/// Builds a payload from a mass, a 3-element centre of mass, and a 9-element inertia (about the
+/// centre of mass), matching libfranka's `m_total`, `F_x_Ctotal`, and `I_total`.
+fn payload_from(mass: f64, center_of_mass: &[f64], inertia: &[f64]) -> RigidBodyInertia {
+    RigidBodyInertia::new(
+        mass,
+        Vector3::from_column_slice(center_of_mass),
+        Matrix3::from_column_slice(inertia),
+    )
+}
+
+/// Checks franka-rs's model outputs against libfranka's, both built from the same URDF.
+///
+/// Reads validation/data/model_cases.txt, produced by validation/reference/model.cpp. That file is
+/// generated inside the devcontainer, where the Pinocchio-backed franka::Model builds; when it is
+/// absent this test skips so the suite stays green. The tolerances account for nalgebra-vs-Pinocchio
+/// differences on the same URDF and are initial values to tighten against the first generated data.
+#[test]
+fn model_matches_libfranka() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/validation/data/model_cases.txt");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        eprintln!("skipping: {path} not present (generate it in the devcontainer via validation/reference/model.cpp)");
+        return;
+    };
+
+    let urdf = include_str!("../../tests/fixtures/fr3_robot.urdf");
+    let model = Model::from_urdf(urdf).unwrap();
+    let kinematics_tolerance = 1e-6;
+    let dynamics_tolerance = 1e-4;
+
+    let mut cases = 0;
+    for line in text.lines() {
+        let mut fields = line.split(' ');
+        let tag = fields.next().expect("tag");
+        let v: Vec<f64> = fields.map(|field| field.parse().expect("number")).collect();
+
+        match tag {
+            "urdf_bytes" => {
+                assert_eq!(
+                    v[0] as usize,
+                    urdf.len(),
+                    "model_cases.txt was generated from a different URDF; regenerate it from tests/fixtures/fr3_robot.urdf"
+                );
+            }
+            "pose" => {
+                assert_eq!(v.len(), 56, "pose: field count");
+                let q = JointVector::from_column_slice(&v[0..7]);
+                let frame = frame_from_index(v[39] as usize);
+                let actual = model
+                    .pose(frame, &q, &isometry_from_columns(&v[7..23]), &isometry_from_columns(&v[23..39]))
+                    .to_homogeneous();
+                assert_close(actual.as_slice(), &v[40..56], kinematics_tolerance);
+            }
+            "zero_jacobian" => {
+                assert_eq!(v.len(), 82, "zero_jacobian: field count");
+                let q = JointVector::from_column_slice(&v[0..7]);
+                let frame = frame_from_index(v[39] as usize);
+                let actual =
+                    model.zero_jacobian(frame, &q, &isometry_from_columns(&v[7..23]), &isometry_from_columns(&v[23..39]));
+                assert_close(actual.as_slice(), &v[40..82], kinematics_tolerance);
+            }
+            "body_jacobian" => {
+                assert_eq!(v.len(), 82, "body_jacobian: field count");
+                let q = JointVector::from_column_slice(&v[0..7]);
+                let frame = frame_from_index(v[39] as usize);
+                let actual =
+                    model.body_jacobian(frame, &q, &isometry_from_columns(&v[7..23]), &isometry_from_columns(&v[23..39]));
+                assert_close(actual.as_slice(), &v[40..82], kinematics_tolerance);
+            }
+            "mass" => {
+                assert_eq!(v.len(), 69, "mass: field count");
+                let q = JointVector::from_column_slice(&v[0..7]);
+                let load = payload_from(v[16], &v[17..20], &v[7..16]);
+                assert_close(model.mass(&q, &load).as_slice(), &v[20..69], dynamics_tolerance);
+            }
+            "coriolis" => {
+                assert_eq!(v.len(), 37, "coriolis: field count");
+                let q = JointVector::from_column_slice(&v[0..7]);
+                let dq = JointVector::from_column_slice(&v[7..14]);
+                let load = payload_from(v[23], &v[24..27], &v[14..23]);
+                assert_close(model.coriolis(&q, &dq, &load).as_slice(), &v[30..37], dynamics_tolerance);
+            }
+            "gravity" => {
+                assert_eq!(v.len(), 21, "gravity: field count");
+                let q = JointVector::from_column_slice(&v[0..7]);
+                let load = payload_from(v[7], &v[8..11], &[0.0; 9]);
+                let gravity = Vector3::from_column_slice(&v[11..14]);
+                assert_close(model.gravity(&q, &load, &gravity).as_slice(), &v[14..21], dynamics_tolerance);
+            }
+            other => panic!("unknown tag {other}"),
+        }
+        cases += 1;
+    }
+    assert!(cases > 0, "no cases in {path}");
+}

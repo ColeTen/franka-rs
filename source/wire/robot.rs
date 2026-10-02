@@ -507,6 +507,298 @@ mod tests {
         assert_eq!(RobotCommand::SIZE, 371);
     }
 
+    /// Loads the committed libfranka reference numbers into a map of key to value.
+    ///
+    /// The file is produced by validation/reference/message_layout.cpp.
+    fn load_reference() -> std::collections::HashMap<String, u64> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/validation/data/message_layout.txt");
+        let text = std::fs::read_to_string(path).unwrap_or_else(|error| {
+            panic!(
+                "cannot read {path}: {error}\n\
+                 regenerate it by building validation/reference/message_layout.cpp and running \
+                 `./message_layout > validation/data/message_layout.txt`"
+            )
+        });
+        let mut values = std::collections::HashMap::new();
+        for line in text.lines() {
+            let (key, value) = line.split_once(' ').expect("record is `key value`");
+            let value = value.trim().parse().expect("value is an integer");
+            if values.insert(key.to_owned(), value).is_some() {
+                panic!("duplicate key {key} in message_layout.txt");
+            }
+        }
+        values
+    }
+
+    /// Returns the reference value for `key`, or panics naming the missing key.
+    fn reference(values: &std::collections::HashMap<String, u64>, key: &str) -> u64 {
+        *values
+            .get(key)
+            .unwrap_or_else(|| panic!("missing reference value for {key}"))
+    }
+
+    /// Asserts one field's offset matches libfranka's, keyed by the franka-rs struct and field names.
+    macro_rules! check_offset {
+        ($values:expr, $t:ty, $field:ident) => {{
+            let key = format!("offset.{}.{}", stringify!($t), stringify!($field));
+            assert_eq!(std::mem::offset_of!($t, $field) as u64, reference($values, &key), "{key}");
+        }};
+    }
+
+    /// Asserts the offsets of several fields of one struct.
+    macro_rules! check_offsets {
+        ($values:expr, $t:ty, [$($field:ident),+ $(,)?]) => {
+            $( check_offset!($values, $t, $field); )+
+        };
+    }
+
+    /// Asserts the discriminants of several variants of one status enum match libfranka's.
+    macro_rules! check_status {
+        ($values:expr, $enum:ident, [$($variant:ident),+ $(,)?]) => {
+            $({
+                let key = format!("status.{}.{}", stringify!($enum), stringify!($variant));
+                assert_eq!($enum::$variant as u64, reference($values, &key), "{key}");
+            })+
+        };
+    }
+
+    /// Checks franka-rs's wire-struct sizes, `Command` discriminants, and protocol version against
+    /// libfranka's own numbers. Per-field byte offsets are not checked here; the live-capture
+    /// comparison against the real robot verifies field positions.
+    #[test]
+    fn wire_struct_sizes_and_commands_match_libfranka() {
+        let values = load_reference();
+
+        assert_eq!(
+            crate::constants::ROBOT_PROTOCOL_VERSION as u64,
+            reference(&values, "version"),
+            "version"
+        );
+
+        let commands = [
+            ("Connect", Command::Connect),
+            ("Move", Command::Move),
+            ("StopMove", Command::StopMove),
+            ("SetCollisionBehavior", Command::SetCollisionBehavior),
+            ("SetJointImpedance", Command::SetJointImpedance),
+            ("SetCartesianImpedance", Command::SetCartesianImpedance),
+            ("SetGuidingMode", Command::SetGuidingMode),
+            ("SetEeToK", Command::SetEeToK),
+            ("SetNeToEe", Command::SetNeToEe),
+            ("SetLoad", Command::SetLoad),
+            ("AutomaticErrorRecovery", Command::AutomaticErrorRecovery),
+            ("GetRobotModel", Command::GetRobotModel),
+        ];
+        for (name, command) in commands {
+            assert_eq!(
+                command as u64,
+                reference(&values, &format!("command.{name}")),
+                "command.{name}"
+            );
+        }
+
+        let sizes = [
+            ("CommandHeader", std::mem::size_of::<CommandHeader>()),
+            ("ConnectRequest", std::mem::size_of::<ConnectRequest>()),
+            ("ConnectResponse", std::mem::size_of::<ConnectResponse>()),
+            ("MoveRequest", std::mem::size_of::<MoveRequest>()),
+            (
+                "SetCollisionBehaviorRequest",
+                std::mem::size_of::<SetCollisionBehaviorRequest>(),
+            ),
+            ("SetJointImpedanceRequest", std::mem::size_of::<SetJointImpedanceRequest>()),
+            (
+                "SetCartesianImpedanceRequest",
+                std::mem::size_of::<SetCartesianImpedanceRequest>(),
+            ),
+            ("SetGuidingModeRequest", std::mem::size_of::<SetGuidingModeRequest>()),
+            ("SetEeToKRequest", std::mem::size_of::<SetEeToKRequest>()),
+            ("SetNeToEeRequest", std::mem::size_of::<SetNeToEeRequest>()),
+            ("SetLoadRequest", std::mem::size_of::<SetLoadRequest>()),
+            ("RawRobotState", std::mem::size_of::<RawRobotState>()),
+            ("MotionGeneratorCommand", std::mem::size_of::<MotionGeneratorCommand>()),
+            ("ControllerCommand", std::mem::size_of::<ControllerCommand>()),
+            ("RobotCommand", std::mem::size_of::<RobotCommand>()),
+        ];
+        for (name, actual) in sizes {
+            assert_eq!(
+                actual as u64,
+                reference(&values, &format!("size.{name}")),
+                "size.{name}"
+            );
+        }
+    }
+
+    /// Checks that each franka-rs wire struct places every field at the same byte offset libfranka
+    /// does. ConnectResponse is omitted (its C++ counterpart is not standard-layout); its size
+    /// check pins its layout.
+    #[test]
+    fn wire_struct_field_offsets_match_libfranka() {
+        let values = load_reference();
+
+        check_offsets!(&values, CommandHeader, [command, command_id, size]);
+        check_offsets!(&values, ConnectRequest, [version, udp_port]);
+        check_offsets!(
+            &values,
+            MoveRequest,
+            [
+                controller_mode,
+                motion_generator_mode,
+                maximum_path_deviation_translation,
+                maximum_path_deviation_rotation,
+                maximum_path_deviation_elbow,
+                maximum_goal_pose_deviation_translation,
+                maximum_goal_pose_deviation_rotation,
+                maximum_goal_pose_deviation_elbow,
+                use_async_motion_generator,
+                maximum_velocity,
+            ]
+        );
+        check_offsets!(
+            &values,
+            SetCollisionBehaviorRequest,
+            [
+                lower_torque_thresholds_acceleration,
+                upper_torque_thresholds_acceleration,
+                lower_torque_thresholds_nominal,
+                upper_torque_thresholds_nominal,
+                lower_force_thresholds_acceleration,
+                upper_force_thresholds_acceleration,
+                lower_force_thresholds_nominal,
+                upper_force_thresholds_nominal,
+            ]
+        );
+        check_offsets!(&values, SetJointImpedanceRequest, [k_theta]);
+        check_offsets!(&values, SetCartesianImpedanceRequest, [k_x]);
+        check_offsets!(&values, SetGuidingModeRequest, [guiding_mode, nullspace]);
+        check_offsets!(&values, SetEeToKRequest, [ee_t_k]);
+        check_offsets!(&values, SetNeToEeRequest, [ne_t_ee]);
+        check_offsets!(&values, SetLoadRequest, [m_load, f_x_cload, i_load]);
+
+        check_offsets!(
+            &values,
+            RawRobotState,
+            [
+                message_id,
+                o_t_ee,
+                o_t_ee_d,
+                f_t_ee,
+                ee_t_k,
+                f_t_ne,
+                ne_t_ee,
+                m_ee,
+                i_ee,
+                f_x_cee,
+                m_load,
+                i_load,
+                f_x_cload,
+                elbow,
+                elbow_d,
+                tau_j,
+                tau_j_d,
+                dtau_j,
+                q,
+                q_d,
+                dq,
+                dq_d,
+                ddq_d,
+                joint_contact,
+                cartesian_contact,
+                joint_collision,
+                cartesian_collision,
+                tau_ext_hat_filtered,
+                o_f_ext_hat_k,
+                k_f_ext_hat_k,
+                o_dp_ee_d,
+                o_ddp_o,
+                elbow_c,
+                delbow_c,
+                ddelbow_c,
+                o_t_ee_c,
+                o_dp_ee_c,
+                o_ddp_ee_c,
+                theta,
+                dtheta,
+                accelerometer_top,
+                accelerometer_bottom,
+                motion_generator_mode,
+                controller_mode,
+                errors,
+                reflex_reason,
+                robot_mode,
+                control_command_success_rate,
+            ]
+        );
+        check_offsets!(
+            &values,
+            MotionGeneratorCommand,
+            [q_c, dq_c, o_t_ee_c, o_dp_ee_c, elbow_c, valid_elbow, motion_generation_finished]
+        );
+        check_offsets!(&values, ControllerCommand, [tau_j_d, torque_command_finished]);
+        check_offsets!(&values, RobotCommand, [message_id, motion, control]);
+    }
+
+    /// Checks that each franka-rs status enum's discriminants match libfranka's.
+    #[test]
+    fn wire_status_enums_match_libfranka() {
+        let values = load_reference();
+
+        check_status!(&values, ConnectStatus, [Success, IncompatibleLibraryVersion]);
+        check_status!(
+            &values,
+            MoveStatus,
+            [
+                Success,
+                MotionStarted,
+                Preempted,
+                PreemptedDueToActivatedSafetyFunctions,
+                CommandRejectedDueToActivatedSafetyFunctions,
+                CommandNotPossibleRejected,
+                StartAtSingularPoseRejected,
+                InvalidArgumentRejected,
+                ReflexAborted,
+                EmergencyAborted,
+                InputErrorAborted,
+                Aborted,
+            ]
+        );
+        check_status!(
+            &values,
+            GetterSetterStatus,
+            [
+                Success,
+                CommandNotPossibleRejected,
+                InvalidArgumentRejected,
+                CommandRejectedDueToActivatedSafetyFunctions,
+            ]
+        );
+        check_status!(
+            &values,
+            StopMoveStatus,
+            [
+                Success,
+                CommandNotPossibleRejected,
+                CommandRejectedDueToActivatedSafetyFunctions,
+                EmergencyAborted,
+                ReflexAborted,
+                Aborted,
+            ]
+        );
+        check_status!(
+            &values,
+            AutomaticErrorRecoveryStatus,
+            [
+                Success,
+                CommandNotPossibleRejected,
+                CommandRejectedDueToActivatedSafetyFunctions,
+                ManualErrorRecoveryRequiredRejected,
+                ReflexAborted,
+                EmergencyAborted,
+                Aborted,
+            ]
+        );
+    }
+
     #[test]
     fn raw_robot_state_from_bytes_roundtrip() {
         let mut bytes = vec![0u8; RawRobotState::SIZE];
