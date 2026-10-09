@@ -76,6 +76,17 @@ pub const MAX_ELBOW_ACCELERATION: f64 = 10.0 - LIMIT_EPS;
 /// Maximum elbow velocity in rad/s.
 pub const MAX_ELBOW_VELOCITY: f64 = 1.5 - LIMIT_EPS;
 
+/// Returns the smaller of `a` and `b` as C++'s `std::min(a, b)` does: `b` only if `b < a`, so a NaN
+/// in `a` is kept and a NaN in `b` ignored (Rust's `f64::min` ignores either).
+fn cpp_min(a: f64, b: f64) -> f64 {
+    if b < a { b } else { a }
+}
+
+/// Returns the larger of `a` and `b` as C++'s `std::max(a, b)` does: `b` only if `a < b`.
+fn cpp_max(a: f64, b: f64) -> f64 {
+    if a < b { b } else { a }
+}
+
 /// Limit the rate of per-joint torque commands.
 ///
 /// Clamps the derivative of each joint value to `max_derivatives[i]`.
@@ -87,8 +98,8 @@ pub fn limit_rate_torques(
     let mut limited = [0.0; 7];
     for i in 0..7 {
         let derivative = (commanded[i] - last_commanded[i]) / DELTA_T;
-        let clamped = derivative.clamp(-max_derivatives[i], max_derivatives[i]);
-        limited[i] = last_commanded[i] + clamped * DELTA_T;
+        limited[i] = last_commanded[i]
+            + cpp_max(cpp_min(derivative, max_derivatives[i]), -max_derivatives[i]) * DELTA_T;
     }
     limited
 }
@@ -110,21 +121,19 @@ pub fn limit_rate_velocity(
 
     // Limit jerk and integrate to get acceleration
     let commanded_acceleration =
-        last_commanded_acceleration + commanded_jerk.clamp(-max_jerk, max_jerk) * DELTA_T;
+        last_commanded_acceleration + cpp_max(cpp_min(commanded_jerk, max_jerk), -max_jerk) * DELTA_T;
 
     // Compute safe acceleration limits based on velocity bounds
-    let safe_max_acceleration = ((max_jerk / max_acceleration)
-        * (upper_limit - last_commanded_velocity))
-        .min(max_acceleration);
-    let safe_min_acceleration = ((max_jerk / max_acceleration)
-        * (lower_limit - last_commanded_velocity))
-        .max(-max_acceleration);
+    let safe_max_acceleration =
+        cpp_min((max_jerk / max_acceleration) * (upper_limit - last_commanded_velocity), max_acceleration);
+    let safe_min_acceleration =
+        cpp_max((max_jerk / max_acceleration) * (lower_limit - last_commanded_velocity), -max_acceleration);
 
     // Limit acceleration and integrate to get velocity. The bounds can cross when the last velocity
     // already exceeds a velocity limit; applying the upper bound first and the lower bound last
     // then yields the lower bound (and `f64::clamp` would panic).
     last_commanded_velocity
-        + commanded_acceleration.min(safe_max_acceleration).max(safe_min_acceleration) * DELTA_T
+        + cpp_max(cpp_min(commanded_acceleration, safe_max_acceleration), safe_min_acceleration) * DELTA_T
 }
 
 /// Limit the rate of a single joint position value.
@@ -222,29 +231,26 @@ fn limit_rate_vector3(
     let jerk_norm = commanded_jerk.norm();
     if jerk_norm > NORM_EPS {
         commanded_acceleration +=
-            (commanded_jerk / jerk_norm) * commanded_jerk.norm().clamp(-max_jerk, max_jerk) * DELTA_T;
+            (commanded_jerk / jerk_norm) * cpp_max(cpp_min(jerk_norm, max_jerk), -max_jerk) * DELTA_T;
     }
 
-    // Compute distance to max velocity along the acceleration direction
+    // Distance to the maximum velocity along the acceleration direction, as libfranka computes it:
+    // with no acceleration the direction is NaN, and when the last velocity already exceeds the
+    // maximum the square root is NaN; either way cpp_min then leaves the acceleration unlimited
+    // by this bound.
     let accel_norm = commanded_acceleration.norm();
-    if accel_norm <= NORM_EPS {
-        return *last_commanded;
-    }
-
     let unit_accel = commanded_acceleration / accel_norm;
     let dot_product = unit_accel.dot(last_commanded);
-    let discriminant =
-        dot_product * dot_product - last_commanded.norm_squared() + max_velocity * max_velocity;
-    let distance_to_max = -dot_product + discriminant.max(0.0).sqrt();
+    let distance_to_max = -dot_product
+        + (dot_product.powi(2) - last_commanded.norm_squared() + max_velocity.powi(2)).sqrt();
 
     // Compute safe acceleration limit
-    let safe_max_acceleration =
-        ((max_jerk / max_acceleration) * distance_to_max).min(max_acceleration);
+    let safe_max_acceleration = cpp_min((max_jerk / max_acceleration) * distance_to_max, max_acceleration);
 
     // Limit acceleration and integrate to get velocity
     let mut limited = *last_commanded;
     if accel_norm > NORM_EPS {
-        limited += unit_accel * accel_norm.min(safe_max_acceleration) * DELTA_T;
+        limited += unit_accel * cpp_min(accel_norm, safe_max_acceleration) * DELTA_T;
     }
 
     limited
@@ -440,6 +446,28 @@ mod tests {
     fn limit_rate_position_no_change() {
         let result = limit_rate_position(2.62, -2.62, 10.0, 5000.0, 1.0, 1.0, 0.0, 0.0);
         assert!((result - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn cartesian_velocity_above_maximum_is_not_acceleration_limited_by_the_velocity_bound() {
+        // Last velocity 3.5 m/s along y exceeds the maximum, and the acceleration is along x, so
+        // libfranka's distance to the maximum velocity is NaN and the acceleration (1 m/s²) passes.
+        let last = [0.0, 3.5, 0.0, 0.0, 0.0, 0.0];
+        let acceleration = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let commanded = [DELTA_T, 3.5, 0.0, 0.0, 0.0, 0.0];
+        let result = limit_rate_cartesian_velocity(
+            MAX_TRANSLATIONAL_VELOCITY,
+            MAX_TRANSLATIONAL_ACCELERATION,
+            MAX_TRANSLATIONAL_JERK,
+            MAX_ROTATIONAL_VELOCITY,
+            MAX_ROTATIONAL_ACCELERATION,
+            MAX_ROTATIONAL_JERK,
+            &commanded,
+            &last,
+            &acceleration,
+        );
+        assert!((result[0] - DELTA_T).abs() < 1e-12, "{result:?}");
+        assert!((result[1] - 3.5).abs() < 1e-12, "{result:?}");
     }
 
     #[test]

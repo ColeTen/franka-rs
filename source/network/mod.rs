@@ -7,8 +7,10 @@ pub use handshake::{connect_gripper, connect_robot, connect_vacuum_gripper};
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::mem::MaybeUninit;
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use socket2::{SockRef, TcpKeepalive};
@@ -61,6 +63,13 @@ pub struct Network {
     /// Message ID of the most recently received robot state. Outgoing robot commands carry this
     /// ID so the robot can match each command to the state it answers. Zero until a state arrives.
     latest_state_message_id: Cell<u64>,
+    /// Motion generator and controller modes (robot-state numbering) of the most recently received
+    /// robot state. Idle and Other until a state arrives.
+    latest_state_modes: Cell<(u8, u8)>,
+    /// Robot mode (robot-state numbering) of the most recently received robot state.
+    latest_robot_mode: Cell<u8>,
+    /// Motion generator and controller modes (robot-state numbering) the running Move requested.
+    current_move_modes: Cell<Option<(u8, u8)>>,
     next_command_id: u32,
     framing: TcpFraming,
     received_responses: HashMap<u32, Vec<u8>>,
@@ -118,6 +127,12 @@ impl Network {
             robot_ip: robot_addr.ip(),
             udp_peer: Cell::new(None),
             latest_state_message_id: Cell::new(0),
+            latest_state_modes: Cell::new((
+                crate::types::MotionGeneratorMode::Idle as u8,
+                crate::wire::robot::CONTROLLER_MODE_OTHER,
+            )),
+            latest_robot_mode: Cell::new(crate::types::RobotMode::Other as u8),
+            current_move_modes: Cell::new(None),
             next_command_id: 0,
             framing: TcpFraming::new(),
             received_responses: HashMap::new(),
@@ -134,9 +149,33 @@ impl Network {
         self.latest_state_message_id.get()
     }
 
-    /// Records `message_id` as the ID of the most recently received robot state.
-    pub(crate) fn record_state_message_id(&self, message_id: u64) {
+    /// Returns the motion generator and controller modes (robot-state numbering) of the most
+    /// recently received robot state.
+    pub(crate) fn latest_state_modes(&self) -> (u8, u8) {
+        self.latest_state_modes.get()
+    }
+
+    /// Returns the robot mode (robot-state numbering) of the most recently received robot state.
+    pub(crate) fn latest_robot_mode(&self) -> u8 {
+        self.latest_robot_mode.get()
+    }
+
+    /// Records the message ID and modes of the most recently received robot state.
+    pub(crate) fn record_state(&self, message_id: u64, robot_mode: u8, motion_generator_mode: u8, controller_mode: u8) {
         self.latest_state_message_id.set(message_id);
+        self.latest_robot_mode.set(robot_mode);
+        self.latest_state_modes.set((motion_generator_mode, controller_mode));
+    }
+
+    /// Returns the motion generator and controller modes (robot-state numbering) of the Move
+    /// currently running, or `None` when no motion was started (libfranka's `current_move_*`).
+    pub(crate) fn current_move_modes(&self) -> Option<(u8, u8)> {
+        self.current_move_modes.get()
+    }
+
+    /// Records the modes of the Move being started, or `None` once it has ended.
+    pub(crate) fn set_current_move_modes(&self, modes: Option<(u8, u8)>) {
+        self.current_move_modes.set(modes);
     }
 
     /// Send a TCP request and return the assigned command ID.
@@ -183,15 +222,8 @@ impl Network {
             return Ok(Some(response));
         }
 
-        // Do a non-blocking read attempt.
-        self.tcp.set_nonblocking(true).ok();
-        let result = self.tcp_try_read_message();
-        self.tcp.set_nonblocking(false).ok();
-
-        match result {
-            Ok(()) => Ok(self.received_responses.remove(&command_id)),
-            Err(e) => Err(e),
-        }
+        self.tcp_try_read_message()?;
+        Ok(self.received_responses.remove(&command_id))
     }
 
     /// Send data over UDP to the robot's last known state-stream address.
@@ -230,47 +262,61 @@ impl Network {
     /// records the sender's address for subsequent `udp_send` calls. Datagrams from any
     /// host other than the robot are discarded.
     pub fn udp_try_receive(&self, buf: &mut [u8]) -> FrankaResult<Option<usize>> {
-        self.udp
-            .set_nonblocking(true)
-            .map_err(|e| FrankaError::network_with_source("set UDP non-blocking", e))?;
-        let result = loop {
-            match self.udp.recv_from(buf) {
-                Ok((n, peer)) if peer.ip() == self.robot_ip => break Ok((n, peer)),
-                Ok(_) => continue,
-                Err(e) => break Err(e),
+        loop {
+            match SockRef::from(&self.udp).recv_from_with_flags(as_uninit(buf), libc::MSG_DONTWAIT) {
+                Ok((n, peer)) => match peer.as_socket() {
+                    Some(peer) if peer.ip() == self.robot_ip => {
+                        self.udp_peer.set(Some(peer));
+                        return Ok(Some(n));
+                    }
+                    _ => continue,
+                },
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(e) => return Err(FrankaError::network_with_source("UDP receive", e)),
             }
-        };
-        self.udp
-            .set_nonblocking(false)
-            .map_err(|e| FrankaError::network_with_source("restore UDP blocking", e))?;
-
-        match result {
-            Ok((n, peer)) => {
-                self.udp_peer.set(Some(peer));
-                Ok(Some(n))
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-            Err(e) => Err(FrankaError::network_with_source("UDP receive", e)),
         }
     }
 
-    /// Check if TCP connection is still alive.
+    /// Returns an error if the robot has closed the TCP connection (libfranka's
+    /// `tcpThrowIfConnectionClosed`): a non-blocking peek that reads zero bytes means the peer
+    /// closed it. Pending data is left in place and the socket's blocking mode is not changed.
+    pub(crate) fn tcp_throw_if_connection_closed(&self) -> FrankaResult<()> {
+        let mut byte = [0u8; 1];
+        match tcp_receive_nonblocking(&self.tcp, &mut byte, libc::MSG_PEEK) {
+            Ok(0) => Err(FrankaError::network("server closed connection")),
+            Ok(_) => Ok(()),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(FrankaError::network_with_source("TCP connection check", e)),
+        }
+    }
+
+    /// Returns whether the TCP socket reports neither an error nor a hang-up, as libfranka's
+    /// `isTcpSocketAlive` (a zero-timeout poll for errors). The socket's pending error is not
+    /// cleared.
     pub fn is_tcp_alive(&self) -> bool {
-        let sock_ref = SockRef::from(&self.tcp);
-        sock_ref.take_error().map(|e| e.is_none()).unwrap_or(false)
+        // Errors and hang-ups are always reported by poll, so no events are requested.
+        let mut poll_fd = libc::pollfd { fd: self.tcp.as_raw_fd(), events: 0, revents: 0 };
+        // SAFETY: `poll_fd` is a valid pollfd that outlives the call, and the count is 1.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+        ready == 0
     }
 
     // --- Internal helpers ---
 
     /// Read one complete message from TCP and buffer it.
     fn tcp_read_message(&mut self) -> FrankaResult<()> {
-        // Read header if we don't have one pending.
-        if !self.framing.has_pending_header() {
+        // Read the header, continuing any header bytes a non-blocking read left behind.
+        while self.framing.header_bytes_needed() > 0 {
             let mut header_buf = [0u8; CommandHeader::SIZE];
-            self.tcp
-                .read_exact(&mut header_buf)
+            let needed = self.framing.header_bytes_needed();
+            let n = self
+                .tcp
+                .read(&mut header_buf[..needed])
                 .map_err(|e| FrankaError::network_with_source("TCP read header", e))?;
-            self.framing.set_header(&header_buf)?;
+            if n == 0 {
+                return Err(FrankaError::network("server closed connection"));
+            }
+            self.framing.push_header_bytes(&header_buf[..n])?;
         }
 
         // Read remaining payload.
@@ -294,10 +340,14 @@ impl Network {
 
     /// Non-blocking attempt to read a message.
     fn tcp_try_read_message(&mut self) -> FrankaResult<()> {
-        if !self.framing.has_pending_header() {
+        // Header bytes that arrive split across reads are kept in the framing state, so a
+        // would-block in the middle of a header loses nothing.
+        while self.framing.header_bytes_needed() > 0 {
             let mut header_buf = [0u8; CommandHeader::SIZE];
-            match self.tcp.read_exact(&mut header_buf) {
-                Ok(()) => self.framing.set_header(&header_buf)?,
+            let needed = self.framing.header_bytes_needed();
+            match tcp_receive_nonblocking(&self.tcp, &mut header_buf[..needed], 0) {
+                Ok(0) => return Err(FrankaError::network("server closed connection")),
+                Ok(n) => self.framing.push_header_bytes(&header_buf[..n])?,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
                 Err(e) => return Err(FrankaError::network_with_source("TCP read header", e)),
             }
@@ -306,7 +356,7 @@ impl Network {
         while !self.framing.is_complete() {
             let remaining = self.framing.remaining_bytes();
             let mut chunk = vec![0u8; remaining.min(4096)];
-            match self.tcp.read(&mut chunk) {
+            match tcp_receive_nonblocking(&self.tcp, &mut chunk, 0) {
                 Ok(0) => return Err(FrankaError::network("server closed connection")),
                 Ok(n) => self.framing.push_bytes(&chunk[..n]),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
@@ -318,6 +368,19 @@ impl Network {
         self.received_responses.insert(cmd_id, message);
         Ok(())
     }
+}
+
+/// Receives from `tcp` into `buf` without blocking, with `flags` added to `MSG_DONTWAIT`; the
+/// socket's blocking mode is not changed. Returns a `WouldBlock` error if no data is available.
+fn tcp_receive_nonblocking(tcp: &TcpStream, buf: &mut [u8], flags: libc::c_int) -> io::Result<usize> {
+    SockRef::from(tcp).recv_with_flags(as_uninit(buf), libc::MSG_DONTWAIT | flags)
+}
+
+/// Views an initialized byte buffer as the possibly uninitialized buffer socket2 receives into.
+fn as_uninit(buf: &mut [u8]) -> &mut [MaybeUninit<u8>] {
+    // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and the receive calls only write
+    // initialized bytes into the buffer.
+    unsafe { &mut *(buf as *mut [u8] as *mut [MaybeUninit<u8>]) }
 }
 
 impl Drop for Network {

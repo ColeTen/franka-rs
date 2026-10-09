@@ -65,6 +65,63 @@ pub struct MoveRequest {
     pub maximum_velocity: [f64; 7],
 }
 
+/// Controller mode value the robot state reports when no listed controller is active ("other").
+pub const CONTROLLER_MODE_OTHER: u8 = 3;
+
+/// Controller mode requested by a Move command (libfranka `Move::ControllerMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum MoveControllerMode {
+    JointImpedance = 0,
+    CartesianImpedance = 1,
+    ExternalController = 2,
+}
+
+impl From<crate::types::ControllerMode> for MoveControllerMode {
+    fn from(mode: crate::types::ControllerMode) -> Self {
+        use crate::types::ControllerMode;
+        match mode {
+            ControllerMode::JointImpedance => Self::JointImpedance,
+            ControllerMode::CartesianImpedance => Self::CartesianImpedance,
+            ControllerMode::ExternalController => Self::ExternalController,
+        }
+    }
+}
+
+/// Motion generator mode requested by a Move command (libfranka `Move::MotionGeneratorMode`).
+///
+/// Numbered differently from the motion generator mode reported in the robot state, which has an
+/// additional `Idle` first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum MoveMotionGeneratorMode {
+    JointPosition = 0,
+    JointVelocity = 1,
+    CartesianPosition = 2,
+    CartesianVelocity = 3,
+    None = 4,
+}
+
+impl TryFrom<crate::types::MotionGeneratorMode> for MoveMotionGeneratorMode {
+    type Error = crate::errors::FrankaError;
+
+    /// Converts a motion generator mode to the one a Move command requests; `Idle` cannot be
+    /// requested.
+    fn try_from(mode: crate::types::MotionGeneratorMode) -> Result<Self, Self::Error> {
+        use crate::types::MotionGeneratorMode;
+        match mode {
+            MotionGeneratorMode::JointPosition => Ok(Self::JointPosition),
+            MotionGeneratorMode::JointVelocity => Ok(Self::JointVelocity),
+            MotionGeneratorMode::CartesianPosition => Ok(Self::CartesianPosition),
+            MotionGeneratorMode::CartesianVelocity => Ok(Self::CartesianVelocity),
+            MotionGeneratorMode::None => Ok(Self::None),
+            MotionGeneratorMode::Idle => Err(crate::errors::FrankaError::InvalidOperation {
+                message: "a Move command cannot request the Idle motion generator mode".into(),
+            }),
+        }
+    }
+}
+
 /// Move command status codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -738,7 +795,8 @@ mod tests {
         check_offsets!(&values, RobotCommand, [message_id, motion, control]);
     }
 
-    /// Checks that each franka-rs status enum's discriminants match libfranka's.
+    /// Checks that each franka-rs status enum, the robot state's mode values, and the Move request's
+    /// mode values match libfranka's.
     #[test]
     fn wire_status_enums_match_libfranka() {
         let values = load_reference();
@@ -783,6 +841,31 @@ mod tests {
                 ReflexAborted,
                 Aborted,
             ]
+        );
+        {
+            use crate::types::{ControllerMode, MotionGeneratorMode, RobotMode};
+            check_status!(
+                &values,
+                RobotMode,
+                [Other, Idle, Move, Guiding, Reflex, UserStopped, AutomaticErrorRecovery]
+            );
+            check_status!(&values, ControllerMode, [JointImpedance, CartesianImpedance, ExternalController]);
+            check_status!(
+                &values,
+                MotionGeneratorMode,
+                [Idle, JointPosition, JointVelocity, CartesianPosition, CartesianVelocity, None]
+            );
+            assert_eq!(
+                u64::from(CONTROLLER_MODE_OTHER),
+                reference(&values, "status.ControllerMode.Other"),
+                "status.ControllerMode.Other"
+            );
+        }
+        check_status!(&values, MoveControllerMode, [JointImpedance, CartesianImpedance, ExternalController]);
+        check_status!(
+            &values,
+            MoveMotionGeneratorMode,
+            [JointPosition, JointVelocity, CartesianPosition, CartesianVelocity, None]
         );
         check_status!(
             &values,

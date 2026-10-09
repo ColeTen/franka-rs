@@ -1,6 +1,9 @@
 use crate::errors::{FrankaError, FrankaResult};
 use crate::wire::robot::CommandHeader;
 
+/// Largest message buffer (bytes) reserved before any payload byte has arrived.
+const MAX_PREALLOCATION: usize = 64 * 1024;
+
 /// Handles TCP message framing: assembles partial reads into complete messages.
 ///
 /// The protocol uses a fixed-size header (CommandHeader: 12 bytes) followed by
@@ -8,6 +11,8 @@ use crate::wire::robot::CommandHeader;
 /// size (including the header itself).
 pub(super) struct TcpFraming {
     state: FramingState,
+    /// Header bytes received so far while no header is complete (reads can split a header).
+    partial_header: Vec<u8>,
 }
 
 enum FramingState {
@@ -25,7 +30,31 @@ impl TcpFraming {
     pub fn new() -> Self {
         Self {
             state: FramingState::Idle,
+            partial_header: Vec::with_capacity(CommandHeader::SIZE),
         }
+    }
+
+    /// Returns how many header bytes are still needed before the payload can be read (zero while
+    /// a payload is being read).
+    pub fn header_bytes_needed(&self) -> usize {
+        if self.has_pending_header() {
+            0
+        } else {
+            CommandHeader::SIZE - self.partial_header.len()
+        }
+    }
+
+    /// Appends received header bytes; once the header is complete, parses it and begins the body.
+    pub fn push_header_bytes(&mut self, data: &[u8]) -> FrankaResult<()> {
+        self.partial_header.extend_from_slice(data);
+        if self.partial_header.len() < CommandHeader::SIZE {
+            return Ok(());
+        }
+        let header: [u8; CommandHeader::SIZE] = self.partial_header[..]
+            .try_into()
+            .expect("partial header holds exactly one header");
+        self.partial_header.clear();
+        self.set_header(&header)
     }
 
     /// Returns true if we have already parsed a header and are reading payload.
@@ -48,7 +77,9 @@ impl TcpFraming {
             });
         }
 
-        let mut buffer = Vec::with_capacity(size);
+        // The size comes from the peer, so at most MAX_PREALLOCATION bytes are reserved up front;
+        // a larger message grows the buffer as its bytes arrive.
+        let mut buffer = Vec::with_capacity(size.min(MAX_PREALLOCATION));
         buffer.extend_from_slice(header_bytes);
 
         self.state = FramingState::Reading {

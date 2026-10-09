@@ -34,6 +34,7 @@ name = "franka-rs"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "libc",
  "nalgebra",
  "roxmltree",
  "socket2",

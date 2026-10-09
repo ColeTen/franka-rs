@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if time_ms >= TEST_DURATION_MS {
             println!("\nFinished test, shutting down example");
-            control.finish()?;
+            control.finish(&zero_torques)?;
             break;
         }
         // Sending zero torques - if the end effector is configured correctly, the robot should not move.

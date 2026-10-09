@@ -1,15 +1,16 @@
 use crate::control_loop;
 use crate::control_types::MotionType;
-use crate::errors::FrankaResult;
+use crate::errors::{FrankaError, FrankaResult};
 use crate::network::Network;
 use crate::robot_state::RobotState;
 use crate::types::{ControllerMode, MotionGeneratorMode, Torques};
-use crate::wire::robot::{ControllerCommand, MotionGeneratorCommand, RobotCommand};
+use crate::wire::robot::{ControllerCommand, RobotCommand};
 
 /// Active torque control session — read state and write torques without a callback.
 ///
-/// Created via `Robot::start_torque_control()`. The motion is started on creation
-/// and finalized on drop.
+/// Created via `Robot::start_torque_control()`. The motion is started on creation. End it with
+/// [`ActiveTorqueControl::finish`]; dropping it unfinished cancels the motion (StopMove), as
+/// libfranka does.
 pub struct ActiveTorqueControl<'a> {
     network: &'a mut Network,
     motion_id: u32,
@@ -32,95 +33,97 @@ impl<'a> ActiveTorqueControl<'a> {
     }
 
     /// Read the latest robot state from the robot.
-    pub fn read_state(&self) -> FrankaResult<RobotState> {
-        control_loop::receive_robot_state(self.network)
+    ///
+    /// Returns an error once the robot has left the motion (for example after a user stop or a
+    /// reflex), as libfranka's `readOnce` does, and, without reading, once the session has finished.
+    pub fn read_state(&mut self) -> FrankaResult<RobotState> {
+        if self.finished {
+            return Err(finished_error());
+        }
+        let state = control_loop::receive_robot_state(self.network)?;
+        control_loop::check_motion_error(&state, self.motion_id, self.network)?;
+        Ok(state)
     }
 
     /// Send torque commands to the robot.
     ///
-    /// Returns the robot state received after sending.
+    /// Returns the robot state received after sending. Returns an error, without sending, if the
+    /// session has finished or a torque is not finite.
     pub fn write_torques(&mut self, torques: &Torques) -> FrankaResult<RobotState> {
+        if self.finished {
+            return Err(finished_error());
+        }
         let tau_j_d: [f64; 7] = **torques;
+        control_loop::check_finite_joints(&tau_j_d)?;
 
         let control_cmd = ControllerCommand {
             tau_j_d,
             torque_command_finished: 0,
         };
 
-        let motion_cmd = MotionGeneratorCommand {
-            q_c: [0.0; 7],
-            dq_c: [0.0; 7],
-            o_t_ee_c: [0.0; 16],
-            o_dp_ee_c: [0.0; 6],
-            elbow_c: [0.0; 2],
-            valid_elbow: 0,
-            motion_generation_finished: 0,
-        };
-
         let robot_cmd = RobotCommand {
             message_id: self.network.latest_state_message_id(),
-            motion: motion_cmd,
+            motion: crate::motion_conversion::empty_command(),
             control: control_cmd,
         };
-
-        let bytes = struct_to_bytes(&robot_cmd);
-        self.network.udp_send(&bytes)?;
+        control_loop::send_robot_command(self.network, &robot_cmd)?;
 
         self.read_state()
     }
 
-    /// Signal that this control session is finished.
+    /// Ends the control session with `torques` as the final command, as libfranka's
+    /// `writeOnce` with `motion_finished` set does: the command is sent with its finished flag
+    /// while the robot still reports the controller running, then the Move response is awaited.
     ///
-    /// Sends the final command and releases control. Called automatically on drop.
-    pub fn finish(&mut self) -> FrankaResult<()> {
+    /// Returns an error, without sending, if the session has already finished, a torque is not
+    /// finite, or a motion generator is running. If finishing fails, the session stays unfinished
+    /// and dropping it cancels the motion.
+    pub fn finish(&mut self, torques: &Torques) -> FrankaResult<()> {
         if self.finished {
-            return Ok(());
+            return Err(finished_error());
         }
-        self.finished = true;
-
-        let control_cmd = ControllerCommand {
-            tau_j_d: [0.0; 7],
-            torque_command_finished: 1,
-        };
-
-        let motion_cmd = MotionGeneratorCommand {
-            q_c: [0.0; 7],
-            dq_c: [0.0; 7],
-            o_t_ee_c: [0.0; 16],
-            o_dp_ee_c: [0.0; 6],
-            elbow_c: [0.0; 2],
-            valid_elbow: 0,
-            motion_generation_finished: 0,
-        };
+        control_loop::check_finite_joints(torques)?;
+        let (motion_generator_mode, _) = self.network.latest_state_modes();
+        if motion_generator_mode != MotionGeneratorMode::Idle as u8 && motion_generator_mode != MotionGeneratorMode::None as u8 {
+            return Err(FrankaError::InvalidOperation {
+                message: "a motion generator is still running; cannot finish external torque control".into(),
+            });
+        }
 
         let robot_cmd = RobotCommand {
             message_id: self.network.latest_state_message_id(),
-            motion: motion_cmd,
-            control: control_cmd,
+            motion: crate::motion_conversion::empty_command(),
+            control: ControllerCommand {
+                tau_j_d: **torques,
+                torque_command_finished: 1,
+            },
         };
-
-        let bytes = struct_to_bytes(&robot_cmd);
-        self.network.udp_send(&bytes)?;
-
-        control_loop::finish_motion(self.network, self.motion_id)
+        control_loop::finish_motion(self.network, self.motion_id, robot_cmd)?;
+        self.finished = true;
+        Ok(())
     }
 }
 
 impl Drop for ActiveTorqueControl<'_> {
+    /// Cancels the motion if it was not finished.
     fn drop(&mut self) {
         if !self.finished {
-            let _ = self.finish();
+            self.finished = true;
+            let _ = control_loop::cancel_motion(self.network, self.motion_id);
         }
     }
 }
 
 /// Active motion control session — read state and write motion commands without a callback.
 ///
-/// Created via `Robot::start_motion_control::<M>()`. The motion is started on creation
-/// and finalized on drop.
+/// Created via `Robot::start_motion_control::<M>()`. The motion is started on creation. End it with
+/// [`ActiveMotionControl::finish`]; dropping it unfinished cancels the motion (StopMove), as
+/// libfranka does.
 pub struct ActiveMotionControl<'a, M: MotionType> {
     network: &'a mut Network,
     motion_id: u32,
+    /// Controller the motion was started with; decides whether torques must accompany commands.
+    controller_mode: ControllerMode,
     finished: bool,
     _marker: std::marker::PhantomData<M>,
 }
@@ -139,109 +142,135 @@ impl<'a, M: MotionType> ActiveMotionControl<'a, M> {
         Ok(Self {
             network,
             motion_id,
+            controller_mode,
             finished: false,
             _marker: std::marker::PhantomData,
         })
     }
 
     /// Read the latest robot state.
-    pub fn read_state(&self) -> FrankaResult<RobotState> {
-        control_loop::receive_robot_state(self.network)
-    }
-
-    /// Send a motion command to the robot.
     ///
-    /// Returns the robot state received after sending.
-    pub fn write_motion(&mut self, command: &MotionGeneratorCommand) -> FrankaResult<RobotState> {
-        let control_cmd = ControllerCommand {
-            tau_j_d: [0.0; 7],
-            torque_command_finished: 0,
-        };
-
-        let robot_cmd = RobotCommand {
-            message_id: self.network.latest_state_message_id(),
-            motion: *command,
-            control: control_cmd,
-        };
-
-        let bytes = struct_to_bytes(&robot_cmd);
-        self.network.udp_send(&bytes)?;
-
-        self.read_state()
-    }
-
-    /// Send both motion and torque commands simultaneously.
-    pub fn write_motion_with_torques(
-        &mut self,
-        motion: &MotionGeneratorCommand,
-        torques: &Torques,
-    ) -> FrankaResult<RobotState> {
-        let tau_j_d: [f64; 7] = **torques;
-        let control_cmd = ControllerCommand {
-            tau_j_d,
-            torque_command_finished: 0,
-        };
-
-        let robot_cmd = RobotCommand {
-            message_id: self.network.latest_state_message_id(),
-            motion: *motion,
-            control: control_cmd,
-        };
-
-        let bytes = struct_to_bytes(&robot_cmd);
-        self.network.udp_send(&bytes)?;
-
-        self.read_state()
-    }
-
-    /// Signal that this motion is finished.
-    pub fn finish(&mut self) -> FrankaResult<()> {
+    /// Returns an error once the robot has left the motion, as libfranka's `readOnce` does, and,
+    /// without reading, once the session has finished.
+    pub fn read_state(&mut self) -> FrankaResult<RobotState> {
         if self.finished {
-            return Ok(());
+            return Err(finished_error());
         }
-        self.finished = true;
+        let state = control_loop::receive_robot_state(self.network)?;
+        control_loop::check_motion_error(&state, self.motion_id, self.network)?;
+        Ok(state)
+    }
 
-        let motion_cmd = MotionGeneratorCommand {
-            q_c: [0.0; 7],
-            dq_c: [0.0; 7],
-            o_t_ee_c: [0.0; 16],
-            o_dp_ee_c: [0.0; 6],
-            elbow_c: [0.0; 2],
-            valid_elbow: 0,
-            motion_generation_finished: 1,
+    /// Returns an error unless this session accepts a command: not finished, and torques given
+    /// exactly when the motion was started with the external controller (libfranka's `writeOnce`
+    /// checks).
+    fn check_writable(&self, with_torques: bool) -> FrankaResult<()> {
+        if self.finished {
+            return Err(finished_error());
+        }
+        let external = self.controller_mode == ControllerMode::ExternalController;
+        if with_torques && !external {
+            return Err(FrankaError::InvalidOperation {
+                message: "torques can only be commanded with the ExternalController mode".into(),
+            });
+        }
+        if !with_torques && external {
+            return Err(FrankaError::InvalidOperation {
+                message: "torque command missing: the motion was started with ExternalController".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the robot command for `motion` and optional `torques`, after libfranka's checks
+    /// (finite values, a homogeneous pose, a valid elbow).
+    fn robot_command(&self, motion: &M, torques: Option<&Torques>) -> FrankaResult<RobotCommand> {
+        let motion = motion.active_command()?;
+        let tau_j_d = match torques {
+            Some(torques) => {
+                control_loop::check_finite_joints(torques)?;
+                **torques
+            }
+            None => [0.0; 7],
         };
-
-        let control_cmd = ControllerCommand {
-            tau_j_d: [0.0; 7],
-            torque_command_finished: 0,
-        };
-
-        let robot_cmd = RobotCommand {
+        Ok(RobotCommand {
             message_id: self.network.latest_state_message_id(),
-            motion: motion_cmd,
-            control: control_cmd,
-        };
+            motion,
+            control: ControllerCommand { tau_j_d, torque_command_finished: 0 },
+        })
+    }
 
-        let bytes = struct_to_bytes(&robot_cmd);
-        self.network.udp_send(&bytes)?;
+    /// Sends `motion` to the robot and returns the robot state received after sending.
+    ///
+    /// Returns an error, without sending, if the session has finished, was started with the
+    /// external controller (which needs [`ActiveMotionControl::write_motion_with_torques`]), or the
+    /// command is invalid (non-finite value, non-homogeneous pose, elbow sign not ±1).
+    pub fn write_motion(&mut self, motion: &M) -> FrankaResult<RobotState> {
+        self.check_writable(false)?;
+        let robot_cmd = self.robot_command(motion, None)?;
+        control_loop::send_robot_command(self.network, &robot_cmd)?;
+        self.read_state()
+    }
 
-        control_loop::finish_motion(self.network, self.motion_id)
+    /// Sends `motion` and `torques` together and returns the robot state received after sending.
+    ///
+    /// Returns an error, without sending, if the session has finished, was not started with the
+    /// external controller, or a command is invalid.
+    pub fn write_motion_with_torques(&mut self, motion: &M, torques: &Torques) -> FrankaResult<RobotState> {
+        self.check_writable(true)?;
+        let robot_cmd = self.robot_command(motion, Some(torques))?;
+        control_loop::send_robot_command(self.network, &robot_cmd)?;
+        self.read_state()
+    }
+
+    /// Ends the motion with `motion` as the final command, as libfranka's `writeOnce` with
+    /// `motion_finished` set does: the command is sent with its finished flag while the robot still
+    /// reports the motion running, then the Move response is awaited.
+    ///
+    /// Returns an error, without sending, under the same conditions as
+    /// [`ActiveMotionControl::write_motion`]. If finishing fails, the motion stays unfinished and
+    /// dropping it cancels the motion.
+    pub fn finish(&mut self, motion: &M) -> FrankaResult<()> {
+        self.check_writable(false)?;
+        let robot_cmd = self.robot_command(motion, None)?;
+        self.finish_with(robot_cmd)
+    }
+
+    /// Ends a motion started with the external controller, with `motion` and `torques` as the
+    /// final commands. As in libfranka, only the motion command carries the finished flag.
+    ///
+    /// Returns an error, without sending, under the same conditions as
+    /// [`ActiveMotionControl::write_motion_with_torques`].
+    pub fn finish_with_torques(&mut self, motion: &M, torques: &Torques) -> FrankaResult<()> {
+        self.check_writable(true)?;
+        let robot_cmd = self.robot_command(motion, Some(torques))?;
+        self.finish_with(robot_cmd)
+    }
+
+    /// Sets the motion-finished flag of `robot_cmd`, finishes the motion with it, and marks the
+    /// session finished on success.
+    fn finish_with(&mut self, mut robot_cmd: RobotCommand) -> FrankaResult<()> {
+        robot_cmd.motion.motion_generation_finished = 1;
+        control_loop::finish_motion(self.network, self.motion_id, robot_cmd)?;
+        self.finished = true;
+        Ok(())
     }
 }
 
 impl<M: MotionType> Drop for ActiveMotionControl<'_, M> {
+    /// Cancels the motion if it was not finished.
     fn drop(&mut self) {
         if !self.finished {
-            let _ = self.finish();
+            self.finished = true;
+            let _ = control_loop::cancel_motion(self.network, self.motion_id);
         }
     }
 }
 
-fn struct_to_bytes<T: Copy>(value: &T) -> Vec<u8> {
-    let size = std::mem::size_of::<T>();
-    let mut bytes = vec![0u8; size];
-    unsafe {
-        std::ptr::copy_nonoverlapping(value as *const T as *const u8, bytes.as_mut_ptr(), size);
+/// Error for a read, write or finish after the session has finished (libfranka: "writeOnce must not be
+/// called after the motion has finished").
+fn finished_error() -> FrankaError {
+    FrankaError::InvalidOperation {
+        message: "the motion has already finished".into(),
     }
-    bytes
 }

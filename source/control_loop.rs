@@ -1,3 +1,4 @@
+use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
 
 use crate::constants::DELTA_T;
@@ -5,14 +6,12 @@ use crate::control_types::{is_finished, motion_value, MotionResult, MotionType};
 use crate::errors::{FrankaError, FrankaResult};
 use crate::joint_velocity_limits::JointVelocityLimits;
 use crate::logging::Logger;
-use crate::lowpass_filter::{self, MAX_CUTOFF_FREQUENCY};
+use crate::lowpass_filter;
+use crate::motion_conversion::{self, FilterState};
 use crate::network::Network;
 use crate::rate_limiting;
 use crate::robot_state::RobotState;
-use crate::types::{
-    CartesianPose, CartesianVelocities, ControllerMode, JointPositions, JointVelocities,
-    MotionGeneratorMode, Torques,
-};
+use crate::types::{ControllerMode, MotionGeneratorMode, Torques};
 use crate::wire::robot::{
     self, ControllerCommand, MotionGeneratorCommand, RawRobotState, RobotCommand,
 };
@@ -55,31 +54,29 @@ where
     M: MotionType,
     F: FnMut(&RobotState, Duration) -> MotionResult<M>,
 {
+    // As libfranka's ControlLoop for motion-only callbacks: an external controller needs torques.
+    if controller_mode == ControllerMode::ExternalController {
+        return Err(FrankaError::InvalidOperation {
+            message: "invalid controller mode for a motion-only control loop: ExternalController needs torques".into(),
+        });
+    }
     let motion_id = start_motion(network, controller_mode, M::motion_generator_mode())?;
 
     let mut logger = Logger::new(Logger::DEFAULT_CAPACITY);
     let mut filter_state = FilterState::new();
 
-    let result = motion_loop_inner(
-        network,
-        motion_id,
-        config,
-        joint_velocity_limits,
-        &mut motion_callback,
-        &mut logger,
-        &mut filter_state,
-    );
-
-    match &result {
-        Ok(()) => {
-            finish_motion(network, motion_id)?;
-            Ok(logger.flush())
-        }
-        Err(_) => {
-            let _ = cancel_motion(network, motion_id);
-            result.map(|()| logger.flush())
-        }
-    }
+    run_and_finish(network, motion_id, |network| {
+        motion_loop_inner(
+            network,
+            motion_id,
+            config,
+            joint_velocity_limits,
+            &mut motion_callback,
+            &mut logger,
+            &mut filter_state,
+        )
+    })?;
+    Ok(logger.flush())
 }
 
 /// Runs the 1kHz control loop for combined motion + torque control.
@@ -107,27 +104,19 @@ where
     let mut logger = Logger::new(Logger::DEFAULT_CAPACITY);
     let mut filter_state = FilterState::new();
 
-    let result = combined_loop_inner(
-        network,
-        motion_id,
-        config,
-        joint_velocity_limits,
-        &mut motion_callback,
-        &mut control_callback,
-        &mut logger,
-        &mut filter_state,
-    );
-
-    match &result {
-        Ok(()) => {
-            finish_motion(network, motion_id)?;
-            Ok(logger.flush())
-        }
-        Err(_) => {
-            let _ = cancel_motion(network, motion_id);
-            result.map(|()| logger.flush())
-        }
-    }
+    run_and_finish(network, motion_id, |network| {
+        combined_loop_inner(
+            network,
+            motion_id,
+            config,
+            joint_velocity_limits,
+            &mut motion_callback,
+            &mut control_callback,
+            &mut logger,
+            &mut filter_state,
+        )
+    })?;
+    Ok(logger.flush())
 }
 
 /// Runs the 1kHz control loop for torque-only control (no motion generation).
@@ -147,17 +136,34 @@ where
 
     let mut logger = Logger::new(Logger::DEFAULT_CAPACITY);
 
-    let result =
-        torque_loop_inner(network, motion_id, config, &mut control_callback, &mut logger);
+    run_and_finish(network, motion_id, |network| {
+        torque_loop_inner(network, motion_id, config, &mut control_callback, &mut logger)
+    })?;
+    Ok(logger.flush())
+}
 
-    match &result {
-        Ok(()) => {
-            finish_motion(network, motion_id)?;
-            Ok(logger.flush())
-        }
-        Err(_) => {
+/// Runs a started motion's control loop, then finishes the motion with the loop's final command,
+/// as libfranka's `ControlLoop::loop` does. If the loop or the finish returns an error, or a
+/// callback panics, the motion is cancelled (StopMove) before the error is returned or the panic
+/// continues.
+fn run_and_finish<L>(network: &mut Network, motion_id: u32, control_loop: L) -> FrankaResult<()>
+where
+    L: FnOnce(&mut Network) -> FrankaResult<RobotCommand>,
+{
+    // The network is only read again by cancel_motion, which needs no invariant that a panic
+    // part-way through the loop could break.
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        control_loop(network).and_then(|finished_command| finish_motion(network, motion_id, finished_command))
+    }));
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
             let _ = cancel_motion(network, motion_id);
-            result.map(|()| logger.flush())
+            Err(error)
+        }
+        Err(panic_payload) => {
+            let _ = cancel_motion(network, motion_id);
+            panic::resume_unwind(panic_payload)
         }
     }
 }
@@ -172,11 +178,13 @@ fn motion_loop_inner<M, F>(
     motion_callback: &mut F,
     logger: &mut Logger,
     filter_state: &mut FilterState,
-) -> FrankaResult<()>
+) -> FrankaResult<RobotCommand>
 where
     M: MotionType,
     F: FnMut(&RobotState, Duration) -> MotionResult<M>,
 {
+    // As libfranka's first updateMotion, which sends no command but checks the connection.
+    network.tcp_throw_if_connection_closed()?;
     let mut state = receive_robot_state(network)?;
     check_motion_error(&state, motion_id, network)?;
 
@@ -201,8 +209,8 @@ where
         logger.log(state.clone(), Some(robot_cmd));
 
         if finished {
-            send_robot_command(network, &robot_cmd)?;
-            return Ok(());
+            // Sent by finish_motion, as libfranka's ControlLoop leaves it to finishMotion.
+            return Ok(robot_cmd);
         }
 
         send_robot_command(network, &robot_cmd)?;
@@ -221,44 +229,50 @@ fn combined_loop_inner<M, MF, CF>(
     control_callback: &mut CF,
     logger: &mut Logger,
     filter_state: &mut FilterState,
-) -> FrankaResult<()>
+) -> FrankaResult<RobotCommand>
 where
     M: MotionType,
     MF: FnMut(&RobotState, Duration) -> MotionResult<M>,
     CF: FnMut(&RobotState, Duration) -> MotionResult<Torques>,
 {
+    // As libfranka's first updateMotion, which sends no command but checks the connection.
+    network.tcp_throw_if_connection_closed()?;
     let mut state = receive_robot_state(network)?;
     check_motion_error(&state, motion_id, network)?;
 
     let mut previous_time = state.time;
+    let mut motion_command = motion_conversion::empty_command();
 
     loop {
         let time_step = state.time.saturating_sub(previous_time);
 
         let control_result = control_callback(&state, time_step);
         let control_command = process_torque_command(&control_result, &state, config)?;
+        let mut finished = is_finished(&control_result);
 
-        let motion_result = motion_callback(&state, time_step);
-        let motion_command =
-            process_motion_command(&motion_result, &state, config, joint_velocity_limits, filter_state)?;
+        // As in libfranka's ControlLoop, the motion callback runs only while the control
+        // callback has not finished; otherwise the previous motion command is kept.
+        if !finished {
+            let motion_result = motion_callback(&state, time_step);
+            motion_command =
+                process_motion_command(&motion_result, &state, config, joint_velocity_limits, filter_state)?;
+            finished = is_finished(&motion_result);
+        }
 
-        let motion_finished = is_finished(&motion_result);
-        let control_finished = is_finished(&control_result);
-        let finished = motion_finished || control_finished;
-
+        // libfranka's finishMotion marks only the motion command as finished when one exists.
         let robot_cmd = build_robot_command(
             network.latest_state_message_id(),
             Some(&motion_command),
             Some(&control_command),
-            motion_finished,
-            control_finished,
+            finished,
+            false,
         );
 
         logger.log(state.clone(), Some(robot_cmd));
 
         if finished {
-            send_robot_command(network, &robot_cmd)?;
-            return Ok(());
+            // Sent by finish_motion, as libfranka's ControlLoop leaves it to finishMotion.
+            return Ok(robot_cmd);
         }
 
         send_robot_command(network, &robot_cmd)?;
@@ -274,10 +288,12 @@ fn torque_loop_inner<F>(
     config: &ControlLoopConfig,
     control_callback: &mut F,
     logger: &mut Logger,
-) -> FrankaResult<()>
+) -> FrankaResult<RobotCommand>
 where
     F: FnMut(&RobotState, Duration) -> MotionResult<Torques>,
 {
+    // As libfranka's first updateMotion, which sends no command but checks the connection.
+    network.tcp_throw_if_connection_closed()?;
     let mut state = receive_robot_state(network)?;
     check_motion_error(&state, motion_id, network)?;
 
@@ -301,8 +317,8 @@ where
         logger.log(state.clone(), Some(robot_cmd));
 
         if finished {
-            send_robot_command(network, &robot_cmd)?;
-            return Ok(());
+            // Sent by finish_motion, as libfranka's ControlLoop leaves it to finishMotion.
+            return Ok(robot_cmd);
         }
 
         send_robot_command(network, &robot_cmd)?;
@@ -312,17 +328,7 @@ where
     }
 }
 
-// --- Motion command processing with filtering and rate limiting ---
-
-struct FilterState {
-    initialized: bool,
-}
-
-impl FilterState {
-    fn new() -> Self {
-        Self { initialized: false }
-    }
-}
+// --- Command processing with filtering and rate limiting ---
 
 fn process_motion_command<M: MotionType>(
     result: &MotionResult<M>,
@@ -331,19 +337,7 @@ fn process_motion_command<M: MotionType>(
     joint_velocity_limits: &JointVelocityLimits,
     filter_state: &mut FilterState,
 ) -> FrankaResult<MotionGeneratorCommand> {
-    let motion = motion_value(result);
-    let mut cmd = MotionGeneratorCommand {
-        q_c: [0.0; 7],
-        dq_c: [0.0; 7],
-        o_t_ee_c: [0.0; 16],
-        o_dp_ee_c: [0.0; 6],
-        elbow_c: [0.0; 2],
-        valid_elbow: 0,
-        motion_generation_finished: 0,
-    };
-
-    convert_motion(&motion, state, config, joint_velocity_limits, filter_state, &mut cmd)?;
-    Ok(cmd)
+    motion_value(result).control_loop_command(state, config, joint_velocity_limits, filter_state)
 }
 
 fn process_torque_command(
@@ -354,7 +348,18 @@ fn process_torque_command(
     let torques = motion_value(result);
     let mut tau_j_d: [f64; 7] = *torques;
 
-    if config.cutoff_frequency < MAX_CUTOFF_FREQUENCY {
+    // As libfranka's lowpassFilter and limitRate, non-finite inputs are rejected before filtering
+    // and limiting: the limiter would otherwise turn an infinite torque into a finite maximum step.
+    if motion_conversion::filters(config)? {
+        check_finite_joints(&tau_j_d)?;
+        if let Some(joint) = state.tau_j_d.iter().position(|value| !value.is_finite()) {
+            return Err(FrankaError::Realtime {
+                message: format!(
+                    "joint {joint} of the robot's last desired torque is not finite: {}",
+                    state.tau_j_d[joint]
+                ),
+            });
+        }
         tau_j_d = lowpass_filter::lowpass_filter_joints(
             DELTA_T,
             &tau_j_d,
@@ -364,6 +369,7 @@ fn process_torque_command(
     }
 
     if config.limit_rate {
+        check_finite_joints(&tau_j_d)?;
         tau_j_d =
             rate_limiting::limit_rate_torques(&rate_limiting::MAX_TORQUE_RATE, &tau_j_d, &state.tau_j_d);
     }
@@ -376,271 +382,6 @@ fn process_torque_command(
     })
 }
 
-/// Trait-driven motion conversion — specializes filtering and rate limiting per motion type.
-fn convert_motion<M: MotionType>(
-    motion: &M,
-    state: &RobotState,
-    config: &ControlLoopConfig,
-    joint_velocity_limits: &JointVelocityLimits,
-    filter_state: &mut FilterState,
-    cmd: &mut MotionGeneratorCommand,
-) -> FrankaResult<()> {
-    let mode = M::motion_generator_mode();
-    match mode {
-        MotionGeneratorMode::JointPosition => {
-            convert_joint_positions(motion, state, config, joint_velocity_limits, filter_state, cmd)
-        }
-        MotionGeneratorMode::JointVelocity => {
-            convert_joint_velocities(motion, state, config, joint_velocity_limits, cmd)
-        }
-        MotionGeneratorMode::CartesianPosition => {
-            convert_cartesian_pose(motion, state, config, filter_state, cmd)
-        }
-        MotionGeneratorMode::CartesianVelocity => {
-            convert_cartesian_velocities(motion, state, config, cmd)
-        }
-        _ => Err(FrankaError::InvalidOperation {
-            message: "invalid motion generator mode for motion command".into(),
-        }),
-    }
-}
-
-fn convert_joint_positions<M: MotionType>(
-    motion: &M,
-    state: &RobotState,
-    config: &ControlLoopConfig,
-    joint_velocity_limits: &JointVelocityLimits,
-    filter_state: &mut FilterState,
-    cmd: &mut MotionGeneratorCommand,
-) -> FrankaResult<()> {
-    let positions: &JointPositions =
-        unsafe { &*(motion as *const M as *const JointPositions) };
-    let mut q_c: [f64; 7] = **positions;
-
-    let reference = if !filter_state.initialized {
-        filter_state.initialized = true;
-        q_c
-    } else {
-        state.q_d
-    };
-
-    if config.cutoff_frequency < MAX_CUTOFF_FREQUENCY {
-        q_c = lowpass_filter::lowpass_filter_joints(
-            DELTA_T,
-            &q_c,
-            &reference,
-            config.cutoff_frequency,
-        );
-    }
-
-    if config.limit_rate {
-        q_c = rate_limiting::limit_rate_joint_positions(
-            &joint_velocity_limits.upper(&reference),
-            &joint_velocity_limits.lower(&reference),
-            &rate_limiting::MAX_JOINT_ACCELERATION,
-            &rate_limiting::MAX_JOINT_JERK,
-            &q_c,
-            &reference,
-            &state.dq_d,
-            &state.ddq_d,
-        );
-    }
-
-    check_finite_joints(&q_c)?;
-    cmd.q_c = q_c;
-    Ok(())
-}
-
-fn convert_joint_velocities<M: MotionType>(
-    motion: &M,
-    state: &RobotState,
-    config: &ControlLoopConfig,
-    joint_velocity_limits: &JointVelocityLimits,
-    cmd: &mut MotionGeneratorCommand,
-) -> FrankaResult<()> {
-    let velocities: &JointVelocities =
-        unsafe { &*(motion as *const M as *const JointVelocities) };
-    let mut dq_c: [f64; 7] = **velocities;
-
-    if config.cutoff_frequency < MAX_CUTOFF_FREQUENCY {
-        dq_c = lowpass_filter::lowpass_filter_joints(
-            DELTA_T,
-            &dq_c,
-            &state.dq_d,
-            config.cutoff_frequency,
-        );
-    }
-
-    if config.limit_rate {
-        dq_c = rate_limiting::limit_rate_joint_velocities(
-            &joint_velocity_limits.upper(&state.q_d),
-            &joint_velocity_limits.lower(&state.q_d),
-            &rate_limiting::MAX_JOINT_ACCELERATION,
-            &rate_limiting::MAX_JOINT_JERK,
-            &dq_c,
-            &state.dq_d,
-            &state.ddq_d,
-        );
-    }
-
-    check_finite_joints(&dq_c)?;
-    cmd.dq_c = dq_c;
-    Ok(())
-}
-
-fn convert_cartesian_pose<M: MotionType>(
-    motion: &M,
-    state: &RobotState,
-    config: &ControlLoopConfig,
-    filter_state: &mut FilterState,
-    cmd: &mut MotionGeneratorCommand,
-) -> FrankaResult<()> {
-    let pose: &CartesianPose =
-        unsafe { &*(motion as *const M as *const CartesianPose) };
-
-    let mut o_t_ee_c = pose.to_column_major();
-
-    let reference_pose = if !filter_state.initialized {
-        filter_state.initialized = true;
-        o_t_ee_c
-    } else {
-        state.o_t_ee_c
-    };
-
-    if config.cutoff_frequency < MAX_CUTOFF_FREQUENCY {
-        o_t_ee_c = lowpass_filter::cartesian_lowpass_filter(
-            DELTA_T,
-            &o_t_ee_c,
-            &reference_pose,
-            config.cutoff_frequency,
-        );
-    }
-
-    if config.limit_rate {
-        o_t_ee_c = rate_limiting::limit_rate_cartesian_pose(
-            rate_limiting::MAX_TRANSLATIONAL_VELOCITY,
-            rate_limiting::MAX_TRANSLATIONAL_ACCELERATION,
-            rate_limiting::MAX_TRANSLATIONAL_JERK,
-            rate_limiting::MAX_ROTATIONAL_VELOCITY,
-            rate_limiting::MAX_ROTATIONAL_ACCELERATION,
-            rate_limiting::MAX_ROTATIONAL_JERK,
-            &o_t_ee_c,
-            &reference_pose,
-            &state.o_dp_ee_c,
-            &state.o_ddp_ee_c,
-        );
-    }
-
-    check_finite_array(&o_t_ee_c)?;
-    cmd.o_t_ee_c = o_t_ee_c;
-
-    if let Some(elbow) = pose.elbow {
-        cmd.valid_elbow = 1;
-        let mut elbow_c = elbow;
-        let reference_elbow = if filter_state.initialized {
-            state.elbow_c
-        } else {
-            elbow_c
-        };
-
-        if config.cutoff_frequency < MAX_CUTOFF_FREQUENCY {
-            elbow_c[0] = lowpass_filter::lowpass_filter(
-                DELTA_T,
-                elbow_c[0],
-                reference_elbow[0],
-                config.cutoff_frequency,
-            );
-        }
-
-        if config.limit_rate {
-            elbow_c[0] = rate_limiting::limit_rate_velocity(
-                rate_limiting::MAX_ELBOW_VELOCITY,
-                -rate_limiting::MAX_ELBOW_VELOCITY,
-                rate_limiting::MAX_ELBOW_ACCELERATION,
-                rate_limiting::MAX_ELBOW_JERK,
-                elbow_c[0],
-                reference_elbow[0],
-                state.delbow_c[0],
-            );
-        }
-        cmd.elbow_c = elbow_c;
-    }
-
-    Ok(())
-}
-
-fn convert_cartesian_velocities<M: MotionType>(
-    motion: &M,
-    state: &RobotState,
-    config: &ControlLoopConfig,
-    cmd: &mut MotionGeneratorCommand,
-) -> FrankaResult<()> {
-    let velocities: &CartesianVelocities =
-        unsafe { &*(motion as *const M as *const CartesianVelocities) };
-
-    let mut o_dp_ee_c = [
-        velocities.linear.x, velocities.linear.y, velocities.linear.z,
-        velocities.angular.x, velocities.angular.y, velocities.angular.z,
-    ];
-
-    if config.cutoff_frequency < MAX_CUTOFF_FREQUENCY {
-        for (i, val) in o_dp_ee_c.iter_mut().enumerate() {
-            *val = lowpass_filter::lowpass_filter(
-                DELTA_T,
-                *val,
-                state.o_dp_ee_c[i],
-                config.cutoff_frequency,
-            );
-        }
-    }
-
-    if config.limit_rate {
-        o_dp_ee_c = rate_limiting::limit_rate_cartesian_velocity(
-            rate_limiting::MAX_TRANSLATIONAL_VELOCITY,
-            rate_limiting::MAX_TRANSLATIONAL_ACCELERATION,
-            rate_limiting::MAX_TRANSLATIONAL_JERK,
-            rate_limiting::MAX_ROTATIONAL_VELOCITY,
-            rate_limiting::MAX_ROTATIONAL_ACCELERATION,
-            rate_limiting::MAX_ROTATIONAL_JERK,
-            &o_dp_ee_c,
-            &state.o_dp_ee_c,
-            &state.o_ddp_ee_c,
-        );
-    }
-
-    check_finite_array(&o_dp_ee_c)?;
-    cmd.o_dp_ee_c = o_dp_ee_c;
-
-    if let Some(elbow) = velocities.elbow {
-        cmd.valid_elbow = 1;
-        let mut elbow_c = elbow;
-
-        if config.cutoff_frequency < MAX_CUTOFF_FREQUENCY {
-            elbow_c[0] = lowpass_filter::lowpass_filter(
-                DELTA_T,
-                elbow_c[0],
-                state.elbow_c[0],
-                config.cutoff_frequency,
-            );
-        }
-
-        if config.limit_rate {
-            elbow_c[0] = rate_limiting::limit_rate_velocity(
-                rate_limiting::MAX_ELBOW_VELOCITY,
-                -rate_limiting::MAX_ELBOW_VELOCITY,
-                rate_limiting::MAX_ELBOW_ACCELERATION,
-                rate_limiting::MAX_ELBOW_JERK,
-                elbow_c[0],
-                state.elbow_c[0],
-                state.delbow_c[0],
-            );
-        }
-        cmd.elbow_c = elbow_c;
-    }
-
-    Ok(())
-}
-
 // --- Network helpers ---
 
 pub(crate) fn start_motion(
@@ -648,9 +389,19 @@ pub(crate) fn start_motion(
     controller_mode: ControllerMode,
     motion_generator_mode: MotionGeneratorMode,
 ) -> FrankaResult<u32> {
+    // As libfranka's startMotion: refuse while a motion is still running.
+    if motion_running(network) {
+        return Err(FrankaError::Control {
+            message: "attempted to start multiple motions".into(),
+            log: Vec::new(),
+        });
+    }
+    let requested = (motion_generator_mode as u8, controller_mode as u8);
+    network.set_current_move_modes(Some(requested));
+
     let request = robot::MoveRequest {
-        controller_mode: controller_mode as u32,
-        motion_generator_mode: motion_generator_mode as u32,
+        controller_mode: robot::MoveControllerMode::from(controller_mode) as u32,
+        motion_generator_mode: robot::MoveMotionGeneratorMode::try_from(motion_generator_mode)? as u32,
         maximum_path_deviation_translation: DEFAULT_DEVIATION_TRANSLATION,
         maximum_path_deviation_rotation: DEFAULT_DEVIATION_ROTATION,
         maximum_path_deviation_elbow: DEFAULT_DEVIATION_ELBOW,
@@ -671,11 +422,41 @@ pub(crate) fn start_motion(
         });
     }
 
+    check_move_response(&response)?;
+
+    // As libfranka's startMotion: read robot states until they report the requested modes,
+    // stopping early if the robot already answers the Move again (an abort or immediate finish).
+    // A rejection there is a control error, as in libfranka.
+    while network.latest_state_modes() != requested {
+        if let Some(response) = network.tcp_try_receive_response(command_id)? {
+            check_move_response(&response).map_err(command_to_control)?;
+            break;
+        }
+        network.tcp_throw_if_connection_closed()?;
+        receive_robot_state(network)?;
+    }
+    Ok(command_id)
+}
+
+/// Converts a [`FrankaError::Command`] into a [`FrankaError::Control`] with the same message, as
+/// libfranka rethrows a CommandException as a ControlException; other errors pass unchanged.
+fn command_to_control(error: FrankaError) -> FrankaError {
+    match error {
+        FrankaError::Command { message } => FrankaError::Control { message, log: Vec::new() },
+        other => other,
+    }
+}
+
+/// Returns an error unless a Move response reports success or that the motion started.
+fn check_move_response(response: &[u8]) -> FrankaResult<()> {
+    if response.len() <= robot::CommandHeader::SIZE {
+        return Err(FrankaError::Protocol {
+            message: "Move response too short".into(),
+        });
+    }
     let status = response[robot::CommandHeader::SIZE];
     match robot::MoveStatus::from_u8(status) {
-        Some(robot::MoveStatus::Success) | Some(robot::MoveStatus::MotionStarted) => {
-            Ok(command_id)
-        }
+        Some(robot::MoveStatus::Success) | Some(robot::MoveStatus::MotionStarted) => Ok(()),
         Some(s) => Err(FrankaError::Command {
             message: format!("Move command rejected: {s:?}"),
         }),
@@ -685,22 +466,66 @@ pub(crate) fn start_motion(
     }
 }
 
-pub(crate) fn finish_motion(network: &mut Network, _motion_id: u32) -> FrankaResult<()> {
-    let command_id = network.tcp_send_request(robot::Command::StopMove as u32, &[])?;
-    let response = network.tcp_blocking_receive_response(command_id)?;
+/// Returns whether the latest robot state reports a running motion generator or external
+/// controller (robot-state numbering: motion generator Idle 0 and None 5, controller
+/// ExternalController 2).
+fn motion_running(network: &Network) -> bool {
+    let (motion_generator_mode, controller_mode) = network.latest_state_modes();
+    (motion_generator_mode != MotionGeneratorMode::Idle as u8 && motion_generator_mode != MotionGeneratorMode::None as u8)
+        || controller_mode == ControllerMode::ExternalController as u8
+}
 
-    if response.len() <= robot::CommandHeader::SIZE {
-        return Err(FrankaError::Protocol {
-            message: "StopMove response too short".into(),
+/// Finishes a motion as libfranka's finishMotion does: sends `finished_command` (whose finished
+/// flag is set) once per received robot state while the robot still reports the motion running,
+/// then waits for the Move response.
+pub(crate) fn finish_motion(network: &mut Network, motion_id: u32, mut finished_command: RobotCommand) -> FrankaResult<()> {
+    // As libfranka: nothing to finish (and no Move response to wait for) if nothing runs.
+    if !motion_running(network) {
+        network.set_current_move_modes(None);
+        return Ok(());
+    }
+    while motion_running(network) {
+        finished_command.message_id = network.latest_state_message_id();
+        send_robot_command(network, &finished_command)?;
+        receive_robot_state(network)?;
+    }
+    let response = network.tcp_blocking_receive_response(motion_id)?;
+    if response.len() > robot::CommandHeader::SIZE
+        && robot::MoveStatus::from_u8(response[robot::CommandHeader::SIZE]) == Some(robot::MoveStatus::ReflexAborted)
+    {
+        return Err(FrankaError::Control {
+            message: "motion finished commanded, but the robot is still moving".into(),
+            log: Vec::new(),
         });
     }
-
+    check_move_response(&response).map_err(command_to_control)?;
+    network.set_current_move_modes(None);
     Ok(())
 }
 
-fn cancel_motion(network: &mut Network, _motion_id: u32) -> FrankaResult<()> {
+/// Cancels a motion as libfranka's cancelMotion does: sends StopMove, reads robot states until the
+/// motion is no longer running, then takes the Move response if it has arrived.
+pub(crate) fn cancel_motion(network: &mut Network, motion_id: u32) -> FrankaResult<()> {
+    // As libfranka: a closed connection cannot carry the StopMove.
+    if !network.is_tcp_alive() {
+        return Err(FrankaError::network("TCP connection is closed; cannot cancel the motion"));
+    }
     let command_id = network.tcp_send_request(robot::Command::StopMove as u32, &[])?;
-    let _ = network.tcp_blocking_receive_response(command_id);
+    let response = network.tcp_blocking_receive_response(command_id)?;
+    if response.len() <= robot::CommandHeader::SIZE || response[robot::CommandHeader::SIZE] != 0 {
+        return Err(FrankaError::Control {
+            message: "StopMove command rejected".into(),
+            log: Vec::new(),
+        });
+    }
+    loop {
+        receive_robot_state(network)?;
+        if !motion_running(network) {
+            break;
+        }
+    }
+    let _ = network.tcp_try_receive_response(motion_id)?;
+    network.set_current_move_modes(None);
     Ok(())
 }
 
@@ -730,7 +555,7 @@ pub(crate) fn receive_robot_state(network: &Network) -> FrankaResult<RobotState>
     }
 
     let raw = newest.expect("loop exits only once a newer state is kept");
-    network.record_state_message_id(raw.message_id);
+    network.record_state(raw.message_id, raw.robot_mode, raw.motion_generator_mode, raw.controller_mode);
     Ok(raw.to_robot_state())
 }
 
@@ -766,24 +591,36 @@ fn decode_robot_state(datagram: &[u8]) -> FrankaResult<RawRobotState> {
     Ok(unsafe { RawRobotState::from_bytes(datagram) })
 }
 
-fn send_robot_command(network: &Network, cmd: &RobotCommand) -> FrankaResult<()> {
+/// Sends a robot command after checking that the robot has not closed the TCP connection, as
+/// libfranka's updateMotion does.
+pub(crate) fn send_robot_command(network: &Network, cmd: &RobotCommand) -> FrankaResult<()> {
+    network.tcp_throw_if_connection_closed()?;
     let bytes = struct_to_bytes(cmd);
     network.udp_send(&bytes)
 }
 
-fn check_motion_error(
-    state: &RobotState,
-    _motion_id: u32,
-    _network: &mut Network,
-) -> FrankaResult<()> {
-    if !state.current_errors.is_empty() {
+/// Returns an error once the robot has left the running motion, as libfranka's throwOnMotionError:
+/// when the latest state's robot mode is not Move, or its modes differ from the running Move's,
+/// the Move response is read to report why (an abort status), or a protocol error if it reports
+/// none.
+pub(crate) fn check_motion_error(state: &RobotState, motion_id: u32, network: &mut Network) -> FrankaResult<()> {
+    let still_running = network.latest_robot_mode() == crate::types::RobotMode::Move as u8
+        && Some(network.latest_state_modes()) == network.current_move_modes();
+    if still_running {
+        return Ok(());
+    }
+    let response = network.tcp_blocking_receive_response(motion_id)?;
+    if let Err(error) = check_move_response(&response) {
         return Err(FrankaError::Control {
-            message: format!("robot reported errors: {:?}", state.current_errors),
+            message: format!("{error} (last motion errors: {:?})", state.last_motion_errors),
             log: Vec::new(),
         });
     }
-    Ok(())
+    Err(FrankaError::Protocol {
+        message: "unexpected reply to a Move command".into(),
+    })
 }
+
 
 fn build_robot_command(
     message_id: u64,
@@ -792,15 +629,7 @@ fn build_robot_command(
     motion_finished: bool,
     control_finished: bool,
 ) -> RobotCommand {
-    let mut motion_cmd = motion.copied().unwrap_or(MotionGeneratorCommand {
-        q_c: [0.0; 7],
-        dq_c: [0.0; 7],
-        o_t_ee_c: [0.0; 16],
-        o_dp_ee_c: [0.0; 6],
-        elbow_c: [0.0; 2],
-        valid_elbow: 0,
-        motion_generation_finished: 0,
-    });
+    let mut motion_cmd = motion.copied().unwrap_or_else(motion_conversion::empty_command);
 
     let mut control_cmd = control.copied().unwrap_or(ControllerCommand {
         tau_j_d: [0.0; 7],
@@ -823,7 +652,7 @@ fn build_robot_command(
 
 // --- Validation helpers ---
 
-fn check_finite_joints(values: &[f64; 7]) -> FrankaResult<()> {
+pub(crate) fn check_finite_joints(values: &[f64; 7]) -> FrankaResult<()> {
     for (i, &v) in values.iter().enumerate() {
         if !v.is_finite() {
             return Err(FrankaError::Realtime {
@@ -834,7 +663,7 @@ fn check_finite_joints(values: &[f64; 7]) -> FrankaResult<()> {
     Ok(())
 }
 
-fn check_finite_array<const N: usize>(values: &[f64; N]) -> FrankaResult<()> {
+pub(crate) fn check_finite_array<const N: usize>(values: &[f64; N]) -> FrankaResult<()> {
     for (i, &v) in values.iter().enumerate() {
         if !v.is_finite() {
             return Err(FrankaError::Realtime {
@@ -928,6 +757,70 @@ mod tests {
         assert_eq!(network.latest_state_message_id(), 10);
         late_sender.join().unwrap();
         tcp_server.join().unwrap();
+    }
+
+    /// Returns a robot state decoded from an all-zero datagram (every desired torque zero).
+    fn zero_state() -> RobotState {
+        decode_robot_state(&[0u8; RawRobotState::SIZE]).unwrap().to_robot_state()
+    }
+
+    /// Returns a control-loop configuration with the given rate limiting and low-pass filter
+    /// (100 Hz) settings.
+    fn torque_config(limit_rate: bool, filter: bool) -> ControlLoopConfig {
+        ControlLoopConfig {
+            limit_rate,
+            cutoff_frequency: if filter { lowpass_filter::DEFAULT_CUTOFF_FREQUENCY } else { lowpass_filter::MAX_CUTOFF_FREQUENCY },
+        }
+    }
+
+    #[test]
+    fn process_torque_command_rejects_non_finite_torque_in_every_configuration() {
+        for bad_value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            for (limit_rate, filter) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut tau = [0.0; 7];
+                tau[3] = bad_value;
+                let result = process_torque_command(
+                    &MotionResult::Continue(Torques::new(tau)),
+                    &zero_state(),
+                    &torque_config(limit_rate, filter),
+                );
+                assert!(
+                    matches!(result, Err(FrankaError::Realtime { .. })),
+                    "torque {bad_value}, limit_rate {limit_rate}, filter {filter}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn process_torque_command_rejects_non_positive_cutoff_frequency() {
+        for cutoff_frequency in [0.0, -10.0, f64::NEG_INFINITY] {
+            let config = ControlLoopConfig { limit_rate: false, cutoff_frequency };
+            let result = process_torque_command(
+                &MotionResult::Continue(Torques::new([1.0; 7])),
+                &zero_state(),
+                &config,
+            );
+            assert!(
+                matches!(result, Err(FrankaError::InvalidOperation { .. })),
+                "cutoff {cutoff_frequency}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn process_torque_command_rejects_non_finite_last_desired_torque_when_filtering() {
+        let mut state = zero_state();
+        state.tau_j_d[0] = f64::NAN;
+        let result = process_torque_command(
+            &MotionResult::Continue(Torques::new([0.0; 7])),
+            &state,
+            &torque_config(false, true),
+        );
+        assert!(
+            matches!(&result, Err(FrankaError::Realtime { message }) if message.contains("last desired torque")),
+            "{result:?}"
+        );
     }
 
     #[test]

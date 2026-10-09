@@ -105,6 +105,12 @@ pub enum FrankaError {
 
     #[error("invalid operation: {message}")]
     InvalidOperation { message: String },
+
+    /// A command or filter/limiter input is invalid: a non-finite value, a cutoff frequency or
+    /// sample time out of range, a pose that is not a homogeneous transformation, or an elbow whose
+    /// joint-4 sign is not ±1 (libfranka's `std::invalid_argument`).
+    #[error("invalid argument: {message}")]
+    InvalidArgument { message: String },
 }
 
 /// Convenience type alias for results from franka-rs operations.

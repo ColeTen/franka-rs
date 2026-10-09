@@ -53,24 +53,27 @@ pub enum Frame {
     Stiffness,
 }
 
-/// Robot operating mode.
+/// Robot operating mode, numbered as in the robot state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum RobotMode {
-    Other,
-    Idle,
-    Move,
-    Guiding,
-    Reflex,
-    UserStopped,
-    AutomaticErrorRecovery,
+    Other = 0,
+    Idle = 1,
+    Move = 2,
+    Guiding = 3,
+    Reflex = 4,
+    UserStopped = 5,
+    AutomaticErrorRecovery = 6,
 }
 
-/// Active controller mode on the robot.
+/// Active controller mode on the robot, numbered as in the robot state (which additionally uses 3
+/// for "other", see `wire::robot::CONTROLLER_MODE_OTHER`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum ControllerMode {
-    JointImpedance,
-    CartesianImpedance,
-    ExternalController,
+    JointImpedance = 0,
+    CartesianImpedance = 1,
+    ExternalController = 2,
 }
 
 /// Whether to enforce real-time scheduling for the control loop thread.
@@ -80,15 +83,17 @@ pub enum RealtimeConfig {
     Ignore,
 }
 
-/// Motion generator mode (internal, reflects what the robot is currently doing).
+/// Motion generator mode (reflects what the robot is currently doing), numbered as in the robot
+/// state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum MotionGeneratorMode {
-    Idle,
-    JointPosition,
-    JointVelocity,
-    CartesianPosition,
-    CartesianVelocity,
-    None,
+    Idle = 0,
+    JointPosition = 1,
+    JointVelocity = 2,
+    CartesianPosition = 3,
+    CartesianVelocity = 4,
+    None = 5,
 }
 
 // === Newtype impls ===

@@ -1,6 +1,6 @@
 use std::ops::ControlFlow;
 
-use crate::types::{CartesianPose, CartesianVelocities, JointPositions, JointVelocities, Torques};
+use crate::types::{CartesianPose, CartesianVelocities, JointPositions, JointVelocities};
 
 /// Motion command returned by a user's control callback.
 ///
@@ -8,8 +8,10 @@ use crate::types::{CartesianPose, CartesianVelocities, JointPositions, JointVelo
 /// or `ControlFlow::Break(cmd)` to send the final command and stop.
 pub type MotionResult<T> = ControlFlow<T, T>;
 
-/// Trait for types that can be used as motion commands.
-pub trait MotionType: Clone + Copy + std::fmt::Debug {
+/// Trait for types that can be used as motion commands: joint positions, joint velocities,
+/// Cartesian pose and Cartesian velocities. It is sealed; how each type becomes a robot command is
+/// defined in this crate.
+pub trait MotionType: Clone + Copy + std::fmt::Debug + crate::motion_conversion::ConvertMotion {
     /// The wire-format motion generator mode for this type.
     fn motion_generator_mode() -> crate::types::MotionGeneratorMode;
 }
@@ -35,12 +37,6 @@ impl MotionType for CartesianPose {
 impl MotionType for CartesianVelocities {
     fn motion_generator_mode() -> crate::types::MotionGeneratorMode {
         crate::types::MotionGeneratorMode::CartesianVelocity
-    }
-}
-
-impl MotionType for Torques {
-    fn motion_generator_mode() -> crate::types::MotionGeneratorMode {
-        crate::types::MotionGeneratorMode::None
     }
 }
 
