@@ -5,6 +5,11 @@ edition = "2024"
 
 [dependencies]
 bitflags = "2"
-nalgebra = "0.33"
-socket2 = "0.5"
+libc = "0.2"
+nalgebra = "0.35.0"
+roxmltree = "0.21.1"
+socket2 = "0.6.5"
 thiserror = "2"
+
+[lib]
+path = "source/lib.rs"

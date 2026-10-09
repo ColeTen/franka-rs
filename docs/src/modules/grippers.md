@@ -1,5 +1,14 @@
 # Gripper & Vacuum Gripper
 
+> **Known issue (not validated):** libfranka's gripper and vacuum gripper protocols use a 10-byte
+> message header (`command: u16`, defined in `wire::gripper` and `wire::vacuum`), but `Network`
+> frames these connections with the robot's 12-byte header, so the gripper interfaces are not
+> expected to work with real hardware until this is fixed. They have not been tested on hardware.
+>
+> Command results: `Ok(true)` on success, `Ok(false)` when the device reports the command
+> unsuccessful (gripper), `FrankaError::Command` when it reports failure or abort,
+> `FrankaError::Protocol` for an unknown status. An unknown vacuum device status reads as `Red`.
+
 ## Parallel Gripper
 
 ### Overview
@@ -156,12 +165,8 @@ let mut vacuum = VacuumGripper::connect("172.16.0.2")?;
 
 ### Vacuum Profiles
 
-| Profile | Behavior |
-|---------|----------|
-| `P0` | Slow vacuum build-up, energy saving |
-| `P1` | Medium vacuum |
-| `P2` | Fast vacuum build-up |
-| `P3` | Maximum suction power |
+`VacuumProfile::P0` to `P3` select one of the device's production setup profiles, as configured on
+the device (libfranka documents them only as "production setup profile P0 to P3").
 
 ### Pick and Place
 
@@ -175,7 +180,7 @@ let mut vacuum = VacuumGripper::connect("172.16.0.2")?;
 let attached = vacuum.vacuum(
     50,                        // vacuum setpoint (10 * mbar)
     Duration::from_secs(3),    // timeout
-    VacuumProfile::P2,         // fast build-up
+    VacuumProfile::P0,         // production setup profile
 )?;
 
 if attached {

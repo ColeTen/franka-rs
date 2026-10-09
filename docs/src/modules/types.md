@@ -7,29 +7,30 @@ The `types` module provides domain-specific newtypes that wrap raw numeric array
 ```mermaid
 classDiagram
     class JointPositions {
-        +[f64; 7] inner
+        +[f64; 7] 0
         +new(values: [f64; 7]) Self
         +Deref~[f64; 7]~
     }
 
     class JointVelocities {
-        +[f64; 7] inner
+        +[f64; 7] 0
         +new(values: [f64; 7]) Self
         +Deref~[f64; 7]~
     }
 
     class Torques {
-        +[f64; 7] inner
+        +[f64; 7] 0
         +new(values: [f64; 7]) Self
         +Deref~[f64; 7]~
     }
 
     class CartesianPose {
-        +Isometry3~f64~ inner
+        +[f64; 16] o_t_ee
         +Option~[f64; 2]~ elbow
         +from_isometry(Isometry3) Self
         +from_column_major(&[f64; 16]) Self
         +to_column_major() [f64; 16]
+        +to_isometry() FrankaResult~Isometry3~
         +with_elbow([f64; 2]) Self
     }
 
@@ -124,7 +125,11 @@ let tau = Torques::new([0.0; 7]);
 
 ### `CartesianPose`
 
-End-effector pose in SE(3), stored internally as `nalgebra::Isometry3<f64>`.
+End-effector pose in the base frame, stored exactly as given: a column-major 4x4 homogeneous
+transformation (`o_t_ee`), as libfranka's `CartesianPose`. With filtering and rate limiting off it
+is sent unchanged; it is checked to be a homogeneous transformation when it becomes a command. For
+pose arithmetic, convert to and from `nalgebra::Isometry3<f64>`; `to_isometry` returns an error for
+an invalid matrix instead of repairing it.
 
 ```rust
 // From a column-major 4x4 homogeneous transform
@@ -137,8 +142,9 @@ let pose = CartesianPose::from_isometry(iso);
 // With elbow configuration
 let pose = pose.with_elbow([state.elbow[0], state.elbow[1]]);
 
-// Convert back to wire format
+// Back to the matrix (exactly as stored) or to an isometry for pose arithmetic
 let matrix: [f64; 16] = pose.to_column_major();
+let iso = pose.to_isometry()?;
 ```
 
 ### `CartesianVelocities`
@@ -192,14 +198,14 @@ Which internal controller the robot uses:
 |---------|-------------|
 | `JointImpedance` | Motion-only control (default) |
 | `CartesianImpedance` | Motion-only with Cartesian stiffness |
-| `ExternalController` | Torque control (you provide all torques) |
+| `ExternalController` | Torque control (you provide all torques); not accepted by motion-only control |
 
 ### `RealtimeConfig`
 
 | Variant | Behavior |
 |---------|----------|
-| `Enforce` | Requires SCHED_FIFO (Linux PREEMPT_RT). Production use. |
-| `Ignore` | Normal scheduling. Development/simulation. |
+| `Enforce` | Stored and returned by `Robot::realtime_config()`; franka-rs does not act on it |
+| `Ignore` | Same; the value used by `Robot::connect` |
 
 ## Constants
 
@@ -212,7 +218,11 @@ Which internal controller the robot uses:
 | `VACUUM_GRIPPER_COMMAND_PORT` | `1339` | TCP port for vacuum gripper |
 | `ROBOT_PROTOCOL_VERSION` | `10` | Protocol version for handshake |
 | `GRIPPER_PROTOCOL_VERSION` | `3` | Gripper protocol version |
-| `DEFAULT_TIMEOUT_MS` | `1000` | Network timeout (ms) |
+| `VACUUM_GRIPPER_PROTOCOL_VERSION` | `1` | Vacuum gripper protocol version |
+| `DEFAULT_TIMEOUT_MS` | `1000` | TCP and UDP timeout (ms) |
+| `KEEPALIVE_IDLE_SECS` | `1` | TCP keepalive idle time (s) |
+| `KEEPALIVE_INTERVAL_SECS` | `3` | TCP keepalive probe interval (s) |
+| `KEEPALIVE_PROBE_COUNT` | `1` | Defined but not used (the probe count is not set) |
 
 ## Conversions
 

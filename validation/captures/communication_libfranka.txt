@@ -1,0 +1,38 @@
+WARNING: This example will move the robot! Please make sure to have the user stop button at hand!
+Press Enter to continue...
+Finished moving to initial joint configuration.
+
+Starting communication test.
+#100 Current success rate: 1.00
+#200 Current success rate: 1.00
+#300 Current success rate: 1.00
+#400 Current success rate: 1.00
+#500 Current success rate: 1.00
+#600 Current success rate: 1.00
+#700 Current success rate: 1.00
+#800 Current success rate: 1.00
+#900 Current success rate: 1.00
+#1000 Current success rate: 1.00
+#1100 Current success rate: 1.00
+#1200 Current success rate: 1.00
+#1300 Current success rate: 1.00
+#1400 Current success rate: 1.00
+#1500 Current success rate: 1.00
+#1600 Current success rate: 1.00
+#1700 Current success rate: 1.00
+#1800 Current success rate: 1.00
+#1900 Current success rate: 1.00
+#2000 Current success rate: 1.00
+#2100 Current success rate: 1.00
+#2200 Current success rate: 1.00
+#2300 Current success rate: 1.00
+#2400 Current success rate: 1.00
+#2500 Current success rate: 1.00
+#2600 Current success rate: 1.00
+#2700 Current success rate: 1.00
+#2800 Current success rate: 1.00
+#2900 Current success rate: 1.00
+#3000 Current success rate: 1.00
+#3100 Current success rate: 1.00
+#3200 Current success rate: 1.00
+libfranka: Move command aborted: User Stop pressed!

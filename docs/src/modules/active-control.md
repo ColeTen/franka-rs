@@ -15,32 +15,30 @@ classDiagram
     class ActiveTorqueControl~'a~ {
         -&mut Network network
         -u32 motion_id
-        -u64 message_id
         -bool finished
-        +start(network) FrankaResult~Self~
         +read_state() FrankaResult~RobotState~
-        +write_torques(torques) FrankaResult~RobotState~
-        +finish() FrankaResult~()~
+        +write_torques(&Torques) FrankaResult~RobotState~
+        +finish(&Torques) FrankaResult~()~
     }
 
     class ActiveMotionControl~'a, M: MotionType~ {
         -&mut Network network
         -u32 motion_id
-        -u64 message_id
+        -ControllerMode controller_mode
         -bool finished
         -PhantomData~M~
-        +start(network, controller_mode) FrankaResult~Self~
         +read_state() FrankaResult~RobotState~
-        +write_motion(command) FrankaResult~RobotState~
-        +write_motion_with_torques(motion, torques) FrankaResult~RobotState~
-        +finish() FrankaResult~()~
+        +write_motion(&M) FrankaResult~RobotState~
+        +write_motion_with_torques(&M, &Torques) FrankaResult~RobotState~
+        +finish(&M) FrankaResult~()~
+        +finish_with_torques(&M, &Torques) FrankaResult~()~
     }
 
     ActiveTorqueControl --> Network : borrows &mut
     ActiveMotionControl --> Network : borrows &mut
 
-    note for ActiveTorqueControl "Drop impl calls finish()\nautomatically (RAII)"
-    note for ActiveMotionControl "Drop impl calls finish()\nautomatically (RAII)"
+    note for ActiveTorqueControl "Dropped unfinished: cancels\nthe motion (StopMove)"
+    note for ActiveMotionControl "Dropped unfinished: cancels\nthe motion (StopMove)"
 ```
 
 ## Callback vs. Active Control
@@ -49,14 +47,14 @@ classDiagram
 flowchart LR
     subgraph "Callback Style"
         direction TB
-        CB_ROBOT["robot.control_torques(|state, dt| {<br/>    // your code here<br/>    ControlFlow::Continue(torques)<br/>})"]
+        CB_ROBOT["robot.control_torques(&config, |state, period| {<br/>    // your code here<br/>    ControlFlow::Continue(torques)<br/>})"]
     end
 
     subgraph "Active Control Style"
         direction TB
         AC_START["let mut ctrl = robot.start_torque_control()?"]
-        AC_LOOP["loop {<br/>    let state = ctrl.read_state()?;<br/>    let tau = compute(state);<br/>    ctrl.write_torques(&tau)?;<br/>}"]
-        AC_FINISH["ctrl.finish()? // or drop"]
+        AC_LOOP["let mut state = ctrl.read_state()?;<br/>loop {<br/>    let tau = compute(&state);<br/>    state = ctrl.write_torques(&tau)?;<br/>}"]
+        AC_FINISH["ctrl.finish(&tau)? // or drop to cancel"]
         AC_START --> AC_LOOP --> AC_FINISH
     end
 ```
@@ -74,30 +72,37 @@ let mut ctrl = robot.start_torque_control()?;
 ### Read / Write Loop
 
 ```rust
+let mut state = ctrl.read_state()?;
 loop {
-    let state = ctrl.read_state()?;
     let tau = compute_torques(&state);
 
     if should_stop(&state) {
-        // finish() sends the final zero-torque command and stops motion
-        ctrl.finish()?;
+        // finish() sends the final torques with the finished flag until the robot stops the
+        // controller, then waits for the robot's confirmation
+        ctrl.finish(&Torques::new(tau))?;
         break;
     }
 
-    // write_torques sends the command and returns the next state
-    let next_state = ctrl.write_torques(&Torques::new(tau))?;
+    // write_torques sends the command answering `state` and returns the next state; calling
+    // read_state() as well would skip a state each cycle
+    state = ctrl.write_torques(&Torques::new(tau))?;
 }
 ```
 
+`read_state` (and `write_torques`, which reads the next state) returns an error once the robot has
+left the motion (user stop, reflex), as libfranka's `readOnce` does; `finish` returns an error if
+the robot answers the finish with an abort status. All return `InvalidOperation` after the session
+has finished. Torques are sent unfiltered and unlimited, after the finite check.
+
 ### RAII Cleanup
 
-If the `ActiveTorqueControl` is dropped without calling `finish()`, the `Drop` impl sends a stop command automatically:
+If the `ActiveTorqueControl` is dropped without a successful `finish()` (including during a panic), the `Drop` impl cancels the motion with a StopMove request, as libfranka's destructor does:
 
 ```rust
 {
     let mut ctrl = robot.start_torque_control()?;
     ctrl.write_torques(&Torques::new([0.0; 7]))?;
-    // ctrl dropped here — finish() called automatically
+    // ctrl dropped here — the motion is cancelled (StopMove)
 }
 // robot is usable again
 ```
@@ -118,26 +123,26 @@ let mut ctrl = robot.start_motion_control::<JointPositions>(
 
 ### Writing Motion Commands
 
+Commands have the session's motion type. As in libfranka's active control, they are sent without
+filtering or rate limiting, after libfranka's checks: every value finite, a Cartesian pose a
+homogeneous transformation, an elbow sign of exactly +1 or -1. An invalid command returns an error
+without sending anything.
+
 ```rust
-use franka_rs::wire::robot::MotionGeneratorCommand;
-
-let cmd = MotionGeneratorCommand {
-    q_c: desired_positions,
-    dq_c: [0.0; 7],
-    o_t_ee_c: [0.0; 16],
-    o_dp_ee_c: [0.0; 6],
-    elbow_c: [0.0; 2],
-    valid_elbow: 0,
-    motion_generation_finished: 0,
-};
-
-let state = ctrl.write_motion(&cmd)?;
+let state = ctrl.write_motion(&JointPositions::new(desired_positions))?;
+// ...
+ctrl.finish(&JointPositions::new(final_positions))?;
 ```
 
 ### Combined Motion + Torques
 
+Only for a session started with `ControllerMode::ExternalController`, which must send torques with
+every motion command:
+
 ```rust
-let state = ctrl.write_motion_with_torques(&motion_cmd, &torques)?;
+let state = ctrl.write_motion_with_torques(&motion, &torques)?;
+// ...
+ctrl.finish_with_torques(&final_motion, &final_torques)?;
 ```
 
 ## Ownership and Lifetime
@@ -162,8 +167,8 @@ sequenceDiagram
         Ctrl-->>User: RobotState
     end
 
-    User->>Ctrl: finish() or drop
-    Ctrl->>Net: UDP finish + TCP StopMove
+    User->>Ctrl: finish(final command) or drop
+    Ctrl->>Net: finish: UDP final command until stopped, then Move response; drop: TCP StopMove
     Note over Robot: Borrow released<br/>Robot is usable again
 ```
 

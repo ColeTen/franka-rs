@@ -1,0 +1,931 @@
+/// Wire-format command enum matching research_interface::robot::Command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Command {
+    Connect = 0,
+    Move = 1,
+    StopMove = 2,
+    SetCollisionBehavior = 3,
+    SetJointImpedance = 4,
+    SetCartesianImpedance = 5,
+    SetGuidingMode = 6,
+    SetEeToK = 7,
+    SetNeToEe = 8,
+    SetLoad = 9,
+    AutomaticErrorRecovery = 10,
+    GetRobotModel = 11,
+}
+
+/// TCP message header for robot commands.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct CommandHeader {
+    pub command: u32,
+    pub command_id: u32,
+    pub size: u32,
+}
+
+/// Connect request sent to the robot.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct ConnectRequest {
+    pub version: u16,
+    pub udp_port: u16,
+}
+
+/// Connect response from the robot.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct ConnectResponse {
+    pub status: u8,
+    pub version: u16,
+}
+
+/// Status codes for the Connect command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConnectStatus {
+    Success = 0,
+    IncompatibleLibraryVersion = 1,
+}
+
+/// Move command request.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct MoveRequest {
+    pub controller_mode: u32,
+    pub motion_generator_mode: u32,
+    pub maximum_path_deviation_translation: f64,
+    pub maximum_path_deviation_rotation: f64,
+    pub maximum_path_deviation_elbow: f64,
+    pub maximum_goal_pose_deviation_translation: f64,
+    pub maximum_goal_pose_deviation_rotation: f64,
+    pub maximum_goal_pose_deviation_elbow: f64,
+    pub use_async_motion_generator: u8,
+    pub maximum_velocity: [f64; 7],
+}
+
+/// Controller mode value the robot state reports when no listed controller is active ("other").
+pub const CONTROLLER_MODE_OTHER: u8 = 3;
+
+/// Controller mode requested by a Move command (libfranka `Move::ControllerMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum MoveControllerMode {
+    JointImpedance = 0,
+    CartesianImpedance = 1,
+    ExternalController = 2,
+}
+
+impl From<crate::types::ControllerMode> for MoveControllerMode {
+    fn from(mode: crate::types::ControllerMode) -> Self {
+        use crate::types::ControllerMode;
+        match mode {
+            ControllerMode::JointImpedance => Self::JointImpedance,
+            ControllerMode::CartesianImpedance => Self::CartesianImpedance,
+            ControllerMode::ExternalController => Self::ExternalController,
+        }
+    }
+}
+
+/// Motion generator mode requested by a Move command (libfranka `Move::MotionGeneratorMode`).
+///
+/// Numbered differently from the motion generator mode reported in the robot state, which has an
+/// additional `Idle` first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum MoveMotionGeneratorMode {
+    JointPosition = 0,
+    JointVelocity = 1,
+    CartesianPosition = 2,
+    CartesianVelocity = 3,
+    None = 4,
+}
+
+impl TryFrom<crate::types::MotionGeneratorMode> for MoveMotionGeneratorMode {
+    type Error = crate::errors::FrankaError;
+
+    /// Converts a motion generator mode to the one a Move command requests; `Idle` cannot be
+    /// requested.
+    fn try_from(mode: crate::types::MotionGeneratorMode) -> Result<Self, Self::Error> {
+        use crate::types::MotionGeneratorMode;
+        match mode {
+            MotionGeneratorMode::JointPosition => Ok(Self::JointPosition),
+            MotionGeneratorMode::JointVelocity => Ok(Self::JointVelocity),
+            MotionGeneratorMode::CartesianPosition => Ok(Self::CartesianPosition),
+            MotionGeneratorMode::CartesianVelocity => Ok(Self::CartesianVelocity),
+            MotionGeneratorMode::None => Ok(Self::None),
+            MotionGeneratorMode::Idle => Err(crate::errors::FrankaError::InvalidOperation {
+                message: "a Move command cannot request the Idle motion generator mode".into(),
+            }),
+        }
+    }
+}
+
+/// Move command status codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MoveStatus {
+    Success = 0,
+    MotionStarted = 1,
+    Preempted = 2,
+    PreemptedDueToActivatedSafetyFunctions = 3,
+    CommandRejectedDueToActivatedSafetyFunctions = 4,
+    CommandNotPossibleRejected = 5,
+    StartAtSingularPoseRejected = 6,
+    InvalidArgumentRejected = 7,
+    ReflexAborted = 8,
+    EmergencyAborted = 9,
+    InputErrorAborted = 10,
+    Aborted = 11,
+}
+
+impl MoveStatus {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Success),
+            1 => Some(Self::MotionStarted),
+            2 => Some(Self::Preempted),
+            3 => Some(Self::PreemptedDueToActivatedSafetyFunctions),
+            4 => Some(Self::CommandRejectedDueToActivatedSafetyFunctions),
+            5 => Some(Self::CommandNotPossibleRejected),
+            6 => Some(Self::StartAtSingularPoseRejected),
+            7 => Some(Self::InvalidArgumentRejected),
+            8 => Some(Self::ReflexAborted),
+            9 => Some(Self::EmergencyAborted),
+            10 => Some(Self::InputErrorAborted),
+            11 => Some(Self::Aborted),
+            _ => None,
+        }
+    }
+}
+
+/// SetCollisionBehavior request.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct SetCollisionBehaviorRequest {
+    pub lower_torque_thresholds_acceleration: [f64; 7],
+    pub upper_torque_thresholds_acceleration: [f64; 7],
+    pub lower_torque_thresholds_nominal: [f64; 7],
+    pub upper_torque_thresholds_nominal: [f64; 7],
+    pub lower_force_thresholds_acceleration: [f64; 6],
+    pub upper_force_thresholds_acceleration: [f64; 6],
+    pub lower_force_thresholds_nominal: [f64; 6],
+    pub upper_force_thresholds_nominal: [f64; 6],
+}
+
+/// SetJointImpedance request.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct SetJointImpedanceRequest {
+    pub k_theta: [f64; 7],
+}
+
+/// SetCartesianImpedance request.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct SetCartesianImpedanceRequest {
+    pub k_x: [f64; 6],
+}
+
+/// SetGuidingMode request.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct SetGuidingModeRequest {
+    pub guiding_mode: [u8; 6],
+    pub nullspace: u8,
+}
+
+/// SetEEToK request (16-element column-major homogeneous transform).
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct SetEeToKRequest {
+    pub ee_t_k: [f64; 16],
+}
+
+/// SetNEToEE request (16-element column-major homogeneous transform).
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct SetNeToEeRequest {
+    pub ne_t_ee: [f64; 16],
+}
+
+/// SetLoad request.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct SetLoadRequest {
+    pub m_load: f64,
+    pub f_x_cload: [f64; 3],
+    pub i_load: [f64; 9],
+}
+
+/// Generic command response (status byte only).
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct CommandResponse {
+    pub status: u8,
+}
+
+/// Generic getter/setter command status codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GetterSetterStatus {
+    Success = 0,
+    CommandNotPossibleRejected = 1,
+    InvalidArgumentRejected = 2,
+    CommandRejectedDueToActivatedSafetyFunctions = 3,
+}
+
+impl GetterSetterStatus {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Success),
+            1 => Some(Self::CommandNotPossibleRejected),
+            2 => Some(Self::InvalidArgumentRejected),
+            3 => Some(Self::CommandRejectedDueToActivatedSafetyFunctions),
+            _ => None,
+        }
+    }
+}
+
+/// StopMove status codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StopMoveStatus {
+    Success = 0,
+    CommandNotPossibleRejected = 1,
+    CommandRejectedDueToActivatedSafetyFunctions = 2,
+    EmergencyAborted = 3,
+    ReflexAborted = 4,
+    Aborted = 5,
+}
+
+/// AutomaticErrorRecovery status codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AutomaticErrorRecoveryStatus {
+    Success = 0,
+    CommandNotPossibleRejected = 1,
+    CommandRejectedDueToActivatedSafetyFunctions = 2,
+    ManualErrorRecoveryRequiredRejected = 3,
+    ReflexAborted = 4,
+    EmergencyAborted = 5,
+    Aborted = 6,
+}
+
+// --- UDP wire types (robot state and commands) ---
+
+/// Raw robot state as received over UDP.
+///
+/// This matches the C++ `research_interface::robot::RobotState` packed struct.
+/// All multi-element fields use `f32` on the wire and are converted to `f64` in the public API.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct RawRobotState {
+    pub message_id: u64,
+    pub o_t_ee: [f32; 16],
+    pub o_t_ee_d: [f32; 16],
+    pub f_t_ee: [f32; 16],
+    pub ee_t_k: [f32; 16],
+    pub f_t_ne: [f32; 16],
+    pub ne_t_ee: [f32; 16],
+    pub m_ee: f32,
+    pub i_ee: [f32; 9],
+    pub f_x_cee: [f32; 3],
+    pub m_load: f32,
+    pub i_load: [f32; 9],
+    pub f_x_cload: [f32; 3],
+    pub elbow: [f32; 2],
+    pub elbow_d: [f32; 2],
+    pub tau_j: [f32; 7],
+    pub tau_j_d: [f32; 7],
+    pub dtau_j: [f32; 7],
+    pub q: [f32; 7],
+    pub q_d: [f32; 7],
+    pub dq: [f32; 7],
+    pub dq_d: [f32; 7],
+    pub ddq_d: [f32; 7],
+    pub joint_contact: [f32; 7],
+    pub cartesian_contact: [f32; 6],
+    pub joint_collision: [f32; 7],
+    pub cartesian_collision: [f32; 6],
+    pub tau_ext_hat_filtered: [f32; 7],
+    pub o_f_ext_hat_k: [f32; 6],
+    pub k_f_ext_hat_k: [f32; 6],
+    pub o_dp_ee_d: [f32; 6],
+    pub o_ddp_o: [f32; 3],
+    pub elbow_c: [f32; 2],
+    pub delbow_c: [f32; 2],
+    pub ddelbow_c: [f32; 2],
+    pub o_t_ee_c: [f32; 16],
+    pub o_dp_ee_c: [f32; 6],
+    pub o_ddp_ee_c: [f32; 6],
+    pub theta: [f32; 7],
+    pub dtheta: [f32; 7],
+    /// 6 accelerometers x 3 axes (top PCB).
+    pub accelerometer_top: [[f32; 3]; 6],
+    /// 6 accelerometers x 3 axes (bottom PCB).
+    pub accelerometer_bottom: [[f32; 3]; 6],
+    pub motion_generator_mode: u8,
+    pub controller_mode: u8,
+    pub errors: [u8; 41],
+    pub reflex_reason: [u8; 41],
+    pub robot_mode: u8,
+    pub control_command_success_rate: f32,
+}
+
+/// Motion generator command sent to the robot over UDP.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct MotionGeneratorCommand {
+    pub q_c: [f64; 7],
+    pub dq_c: [f64; 7],
+    pub o_t_ee_c: [f64; 16],
+    pub o_dp_ee_c: [f64; 6],
+    pub elbow_c: [f64; 2],
+    pub valid_elbow: u8,
+    pub motion_generation_finished: u8,
+}
+
+/// Controller command sent to the robot over UDP.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct ControllerCommand {
+    pub tau_j_d: [f64; 7],
+    pub torque_command_finished: u8,
+}
+
+/// Full robot command sent over UDP each control cycle.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+pub struct RobotCommand {
+    pub message_id: u64,
+    pub motion: MotionGeneratorCommand,
+    pub control: ControllerCommand,
+}
+
+// --- Byte conversion utilities for packed structs ---
+
+impl CommandHeader {
+    pub const SIZE: usize = std::mem::size_of::<Self>();
+
+    /// # Safety
+    /// `bytes` must be at least `SIZE` bytes long.
+    pub unsafe fn from_bytes(bytes: &[u8]) -> Self {
+        debug_assert!(bytes.len() >= Self::SIZE);
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
+    }
+
+    pub fn to_bytes(self) -> [u8; Self::SIZE] {
+        unsafe { std::mem::transmute_copy(&self) }
+    }
+}
+
+impl RawRobotState {
+    pub const SIZE: usize = std::mem::size_of::<Self>();
+
+    /// # Safety
+    /// `bytes` must be at least `SIZE` bytes long.
+    pub unsafe fn from_bytes(bytes: &[u8]) -> Self {
+        debug_assert!(bytes.len() >= Self::SIZE);
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
+    }
+
+    /// Convert wire-format errors (u8 array treated as bools) to a bool array.
+    pub fn errors_as_bools(&self) -> [bool; 41] {
+        let mut result = [false; 41];
+        let errors = self.errors;
+        for (i, &val) in errors.iter().enumerate() {
+            result[i] = val != 0;
+        }
+        result
+    }
+
+    /// Convert wire-format reflex reasons to a bool array.
+    pub fn reflex_reason_as_bools(&self) -> [bool; 41] {
+        let mut result = [false; 41];
+        let reflex = self.reflex_reason;
+        for (i, &val) in reflex.iter().enumerate() {
+            result[i] = val != 0;
+        }
+        result
+    }
+
+    /// Convert to the public RobotState type.
+    pub fn to_robot_state(self) -> crate::robot_state::RobotState {
+        use crate::errors::RobotErrors;
+        use crate::robot_state::RobotState;
+        use crate::types::{MotionGeneratorMode, RobotMode};
+
+        // Copy fields out of packed struct to avoid unaligned references.
+        let message_id = self.message_id;
+        let motion_generator_mode = self.motion_generator_mode;
+        let robot_mode = self.robot_mode;
+        let control_command_success_rate = self.control_command_success_rate;
+
+        RobotState {
+            o_t_ee: f32x16_to_f64(self.o_t_ee),
+            o_t_ee_d: f32x16_to_f64(self.o_t_ee_d),
+            f_t_ee: f32x16_to_f64(self.f_t_ee),
+            ee_t_k: f32x16_to_f64(self.ee_t_k),
+            f_t_ne: f32x16_to_f64(self.f_t_ne),
+            ne_t_ee: f32x16_to_f64(self.ne_t_ee),
+            m_ee: self.m_ee as f64,
+            i_ee: f32x9_to_f64(self.i_ee),
+            f_x_cee: f32x3_to_f64(self.f_x_cee),
+            m_load: self.m_load as f64,
+            i_load: f32x9_to_f64(self.i_load),
+            f_x_cload: f32x3_to_f64(self.f_x_cload),
+            elbow: f32x2_to_f64(self.elbow),
+            elbow_d: f32x2_to_f64(self.elbow_d),
+            elbow_c: f32x2_to_f64(self.elbow_c),
+            delbow_c: f32x2_to_f64(self.delbow_c),
+            ddelbow_c: f32x2_to_f64(self.ddelbow_c),
+            tau_j: f32x7_to_f64(self.tau_j),
+            tau_j_d: f32x7_to_f64(self.tau_j_d),
+            dtau_j: f32x7_to_f64(self.dtau_j),
+            q: f32x7_to_f64(self.q),
+            q_d: f32x7_to_f64(self.q_d),
+            dq: f32x7_to_f64(self.dq),
+            dq_d: f32x7_to_f64(self.dq_d),
+            ddq_d: f32x7_to_f64(self.ddq_d),
+            joint_contact: f32x7_to_f64(self.joint_contact),
+            cartesian_contact: f32x6_to_f64(self.cartesian_contact),
+            joint_collision: f32x7_to_f64(self.joint_collision),
+            cartesian_collision: f32x6_to_f64(self.cartesian_collision),
+            tau_ext_hat_filtered: f32x7_to_f64(self.tau_ext_hat_filtered),
+            o_f_ext_hat_k: f32x6_to_f64(self.o_f_ext_hat_k),
+            k_f_ext_hat_k: f32x6_to_f64(self.k_f_ext_hat_k),
+            o_dp_ee_d: f32x6_to_f64(self.o_dp_ee_d),
+            o_ddp_o: f32x3_to_f64(self.o_ddp_o),
+            o_t_ee_c: f32x16_to_f64(self.o_t_ee_c),
+            o_dp_ee_c: f32x6_to_f64(self.o_dp_ee_c),
+            o_ddp_ee_c: f32x6_to_f64(self.o_ddp_ee_c),
+            theta: f32x7_to_f64(self.theta),
+            dtheta: f32x7_to_f64(self.dtheta),
+            current_errors: RobotErrors::from_bool_array(&self.errors_as_bools()),
+            last_motion_errors: RobotErrors::from_bool_array(&self.reflex_reason_as_bools()),
+            control_command_success_rate: control_command_success_rate as f64,
+            robot_mode: RobotMode::from_wire(robot_mode),
+            motion_generator_mode: MotionGeneratorMode::from_wire(motion_generator_mode),
+            time: std::time::Duration::from_millis(message_id),
+        }
+    }
+}
+
+impl RobotCommand {
+    pub const SIZE: usize = std::mem::size_of::<Self>();
+
+    pub fn to_bytes(self) -> Vec<u8> {
+        let mut buf = vec![0u8; Self::SIZE];
+        unsafe {
+            std::ptr::write_unaligned(buf.as_mut_ptr() as *mut Self, self);
+        }
+        buf
+    }
+}
+
+// Conversion helpers (concrete sizes to avoid generic issues with packed struct field copies).
+
+fn f32x2_to_f64(src: [f32; 2]) -> [f64; 2] {
+    [src[0] as f64, src[1] as f64]
+}
+
+fn f32x3_to_f64(src: [f32; 3]) -> [f64; 3] {
+    [src[0] as f64, src[1] as f64, src[2] as f64]
+}
+
+fn f32x6_to_f64(src: [f32; 6]) -> [f64; 6] {
+    let mut dst = [0.0f64; 6];
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d = *s as f64;
+    }
+    dst
+}
+
+fn f32x7_to_f64(src: [f32; 7]) -> [f64; 7] {
+    let mut dst = [0.0f64; 7];
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d = *s as f64;
+    }
+    dst
+}
+
+fn f32x9_to_f64(src: [f32; 9]) -> [f64; 9] {
+    let mut dst = [0.0f64; 9];
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d = *s as f64;
+    }
+    dst
+}
+
+fn f32x16_to_f64(src: [f32; 16]) -> [f64; 16] {
+    let mut dst = [0.0f64; 16];
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d = *s as f64;
+    }
+    dst
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_header_size() {
+        assert_eq!(CommandHeader::SIZE, 12);
+    }
+
+    #[test]
+    fn connect_request_size() {
+        assert_eq!(std::mem::size_of::<ConnectRequest>(), 4);
+    }
+
+    #[test]
+    fn connect_response_size() {
+        assert_eq!(std::mem::size_of::<ConnectResponse>(), 3);
+    }
+
+    #[test]
+    fn motion_generator_command_size() {
+        // 7*8 + 7*8 + 16*8 + 6*8 + 2*8 + 1 + 1 = 56+56+128+48+16+2 = 306
+        assert_eq!(std::mem::size_of::<MotionGeneratorCommand>(), 306);
+    }
+
+    #[test]
+    fn controller_command_size() {
+        // 7*8 + 1 = 57
+        assert_eq!(std::mem::size_of::<ControllerCommand>(), 57);
+    }
+
+    #[test]
+    fn robot_command_size() {
+        // 8 + 306 + 57 = 371
+        assert_eq!(RobotCommand::SIZE, 371);
+    }
+
+    /// Loads the committed libfranka reference numbers into a map of key to value.
+    ///
+    /// The file is produced by validation/reference/message_layout.cpp.
+    fn load_reference() -> std::collections::HashMap<String, u64> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/validation/data/message_layout.txt");
+        let text = std::fs::read_to_string(path).unwrap_or_else(|error| {
+            panic!(
+                "cannot read {path}: {error}\n\
+                 regenerate it by building validation/reference/message_layout.cpp and running \
+                 `./message_layout > validation/data/message_layout.txt`"
+            )
+        });
+        let mut values = std::collections::HashMap::new();
+        for line in text.lines() {
+            let (key, value) = line.split_once(' ').expect("record is `key value`");
+            let value = value.trim().parse().expect("value is an integer");
+            if values.insert(key.to_owned(), value).is_some() {
+                panic!("duplicate key {key} in message_layout.txt");
+            }
+        }
+        values
+    }
+
+    /// Returns the reference value for `key`, or panics naming the missing key.
+    fn reference(values: &std::collections::HashMap<String, u64>, key: &str) -> u64 {
+        *values
+            .get(key)
+            .unwrap_or_else(|| panic!("missing reference value for {key}"))
+    }
+
+    /// Asserts one field's offset matches libfranka's, keyed by the franka-rs struct and field names.
+    macro_rules! check_offset {
+        ($values:expr, $t:ty, $field:ident) => {{
+            let key = format!("offset.{}.{}", stringify!($t), stringify!($field));
+            assert_eq!(std::mem::offset_of!($t, $field) as u64, reference($values, &key), "{key}");
+        }};
+    }
+
+    /// Asserts the offsets of several fields of one struct.
+    macro_rules! check_offsets {
+        ($values:expr, $t:ty, [$($field:ident),+ $(,)?]) => {
+            $( check_offset!($values, $t, $field); )+
+        };
+    }
+
+    /// Asserts the discriminants of several variants of one status enum match libfranka's.
+    macro_rules! check_status {
+        ($values:expr, $enum:ident, [$($variant:ident),+ $(,)?]) => {
+            $({
+                let key = format!("status.{}.{}", stringify!($enum), stringify!($variant));
+                assert_eq!($enum::$variant as u64, reference($values, &key), "{key}");
+            })+
+        };
+    }
+
+    /// Checks franka-rs's wire-struct sizes, `Command` discriminants, and protocol version against
+    /// libfranka's own numbers. Per-field byte offsets are not checked here; the live-capture
+    /// comparison against the real robot verifies field positions.
+    #[test]
+    fn wire_struct_sizes_and_commands_match_libfranka() {
+        let values = load_reference();
+
+        assert_eq!(
+            crate::constants::ROBOT_PROTOCOL_VERSION as u64,
+            reference(&values, "version"),
+            "version"
+        );
+
+        let commands = [
+            ("Connect", Command::Connect),
+            ("Move", Command::Move),
+            ("StopMove", Command::StopMove),
+            ("SetCollisionBehavior", Command::SetCollisionBehavior),
+            ("SetJointImpedance", Command::SetJointImpedance),
+            ("SetCartesianImpedance", Command::SetCartesianImpedance),
+            ("SetGuidingMode", Command::SetGuidingMode),
+            ("SetEeToK", Command::SetEeToK),
+            ("SetNeToEe", Command::SetNeToEe),
+            ("SetLoad", Command::SetLoad),
+            ("AutomaticErrorRecovery", Command::AutomaticErrorRecovery),
+            ("GetRobotModel", Command::GetRobotModel),
+        ];
+        for (name, command) in commands {
+            assert_eq!(
+                command as u64,
+                reference(&values, &format!("command.{name}")),
+                "command.{name}"
+            );
+        }
+
+        let sizes = [
+            ("CommandHeader", std::mem::size_of::<CommandHeader>()),
+            ("ConnectRequest", std::mem::size_of::<ConnectRequest>()),
+            ("ConnectResponse", std::mem::size_of::<ConnectResponse>()),
+            ("MoveRequest", std::mem::size_of::<MoveRequest>()),
+            (
+                "SetCollisionBehaviorRequest",
+                std::mem::size_of::<SetCollisionBehaviorRequest>(),
+            ),
+            ("SetJointImpedanceRequest", std::mem::size_of::<SetJointImpedanceRequest>()),
+            (
+                "SetCartesianImpedanceRequest",
+                std::mem::size_of::<SetCartesianImpedanceRequest>(),
+            ),
+            ("SetGuidingModeRequest", std::mem::size_of::<SetGuidingModeRequest>()),
+            ("SetEeToKRequest", std::mem::size_of::<SetEeToKRequest>()),
+            ("SetNeToEeRequest", std::mem::size_of::<SetNeToEeRequest>()),
+            ("SetLoadRequest", std::mem::size_of::<SetLoadRequest>()),
+            ("RawRobotState", std::mem::size_of::<RawRobotState>()),
+            ("MotionGeneratorCommand", std::mem::size_of::<MotionGeneratorCommand>()),
+            ("ControllerCommand", std::mem::size_of::<ControllerCommand>()),
+            ("RobotCommand", std::mem::size_of::<RobotCommand>()),
+        ];
+        for (name, actual) in sizes {
+            assert_eq!(
+                actual as u64,
+                reference(&values, &format!("size.{name}")),
+                "size.{name}"
+            );
+        }
+    }
+
+    /// Checks that each franka-rs wire struct places every field at the same byte offset libfranka
+    /// does. ConnectResponse is omitted (its C++ counterpart is not standard-layout); its size
+    /// check pins its layout.
+    #[test]
+    fn wire_struct_field_offsets_match_libfranka() {
+        let values = load_reference();
+
+        check_offsets!(&values, CommandHeader, [command, command_id, size]);
+        check_offsets!(&values, ConnectRequest, [version, udp_port]);
+        check_offsets!(
+            &values,
+            MoveRequest,
+            [
+                controller_mode,
+                motion_generator_mode,
+                maximum_path_deviation_translation,
+                maximum_path_deviation_rotation,
+                maximum_path_deviation_elbow,
+                maximum_goal_pose_deviation_translation,
+                maximum_goal_pose_deviation_rotation,
+                maximum_goal_pose_deviation_elbow,
+                use_async_motion_generator,
+                maximum_velocity,
+            ]
+        );
+        check_offsets!(
+            &values,
+            SetCollisionBehaviorRequest,
+            [
+                lower_torque_thresholds_acceleration,
+                upper_torque_thresholds_acceleration,
+                lower_torque_thresholds_nominal,
+                upper_torque_thresholds_nominal,
+                lower_force_thresholds_acceleration,
+                upper_force_thresholds_acceleration,
+                lower_force_thresholds_nominal,
+                upper_force_thresholds_nominal,
+            ]
+        );
+        check_offsets!(&values, SetJointImpedanceRequest, [k_theta]);
+        check_offsets!(&values, SetCartesianImpedanceRequest, [k_x]);
+        check_offsets!(&values, SetGuidingModeRequest, [guiding_mode, nullspace]);
+        check_offsets!(&values, SetEeToKRequest, [ee_t_k]);
+        check_offsets!(&values, SetNeToEeRequest, [ne_t_ee]);
+        check_offsets!(&values, SetLoadRequest, [m_load, f_x_cload, i_load]);
+
+        check_offsets!(
+            &values,
+            RawRobotState,
+            [
+                message_id,
+                o_t_ee,
+                o_t_ee_d,
+                f_t_ee,
+                ee_t_k,
+                f_t_ne,
+                ne_t_ee,
+                m_ee,
+                i_ee,
+                f_x_cee,
+                m_load,
+                i_load,
+                f_x_cload,
+                elbow,
+                elbow_d,
+                tau_j,
+                tau_j_d,
+                dtau_j,
+                q,
+                q_d,
+                dq,
+                dq_d,
+                ddq_d,
+                joint_contact,
+                cartesian_contact,
+                joint_collision,
+                cartesian_collision,
+                tau_ext_hat_filtered,
+                o_f_ext_hat_k,
+                k_f_ext_hat_k,
+                o_dp_ee_d,
+                o_ddp_o,
+                elbow_c,
+                delbow_c,
+                ddelbow_c,
+                o_t_ee_c,
+                o_dp_ee_c,
+                o_ddp_ee_c,
+                theta,
+                dtheta,
+                accelerometer_top,
+                accelerometer_bottom,
+                motion_generator_mode,
+                controller_mode,
+                errors,
+                reflex_reason,
+                robot_mode,
+                control_command_success_rate,
+            ]
+        );
+        check_offsets!(
+            &values,
+            MotionGeneratorCommand,
+            [q_c, dq_c, o_t_ee_c, o_dp_ee_c, elbow_c, valid_elbow, motion_generation_finished]
+        );
+        check_offsets!(&values, ControllerCommand, [tau_j_d, torque_command_finished]);
+        check_offsets!(&values, RobotCommand, [message_id, motion, control]);
+    }
+
+    /// Checks that each franka-rs status enum, the robot state's mode values, and the Move request's
+    /// mode values match libfranka's.
+    #[test]
+    fn wire_status_enums_match_libfranka() {
+        let values = load_reference();
+
+        check_status!(&values, ConnectStatus, [Success, IncompatibleLibraryVersion]);
+        check_status!(
+            &values,
+            MoveStatus,
+            [
+                Success,
+                MotionStarted,
+                Preempted,
+                PreemptedDueToActivatedSafetyFunctions,
+                CommandRejectedDueToActivatedSafetyFunctions,
+                CommandNotPossibleRejected,
+                StartAtSingularPoseRejected,
+                InvalidArgumentRejected,
+                ReflexAborted,
+                EmergencyAborted,
+                InputErrorAborted,
+                Aborted,
+            ]
+        );
+        check_status!(
+            &values,
+            GetterSetterStatus,
+            [
+                Success,
+                CommandNotPossibleRejected,
+                InvalidArgumentRejected,
+                CommandRejectedDueToActivatedSafetyFunctions,
+            ]
+        );
+        check_status!(
+            &values,
+            StopMoveStatus,
+            [
+                Success,
+                CommandNotPossibleRejected,
+                CommandRejectedDueToActivatedSafetyFunctions,
+                EmergencyAborted,
+                ReflexAborted,
+                Aborted,
+            ]
+        );
+        {
+            use crate::types::{ControllerMode, MotionGeneratorMode, RobotMode};
+            check_status!(
+                &values,
+                RobotMode,
+                [Other, Idle, Move, Guiding, Reflex, UserStopped, AutomaticErrorRecovery]
+            );
+            check_status!(&values, ControllerMode, [JointImpedance, CartesianImpedance, ExternalController]);
+            check_status!(
+                &values,
+                MotionGeneratorMode,
+                [Idle, JointPosition, JointVelocity, CartesianPosition, CartesianVelocity, None]
+            );
+            assert_eq!(
+                u64::from(CONTROLLER_MODE_OTHER),
+                reference(&values, "status.ControllerMode.Other"),
+                "status.ControllerMode.Other"
+            );
+        }
+        check_status!(&values, MoveControllerMode, [JointImpedance, CartesianImpedance, ExternalController]);
+        check_status!(
+            &values,
+            MoveMotionGeneratorMode,
+            [JointPosition, JointVelocity, CartesianPosition, CartesianVelocity, None]
+        );
+        check_status!(
+            &values,
+            AutomaticErrorRecoveryStatus,
+            [
+                Success,
+                CommandNotPossibleRejected,
+                CommandRejectedDueToActivatedSafetyFunctions,
+                ManualErrorRecoveryRequiredRejected,
+                ReflexAborted,
+                EmergencyAborted,
+                Aborted,
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_robot_state_from_bytes_roundtrip() {
+        let mut bytes = vec![0u8; RawRobotState::SIZE];
+        bytes[0..8].copy_from_slice(&42u64.to_ne_bytes());
+
+        let state = unsafe { RawRobotState::from_bytes(&bytes) };
+        let msg_id = { state.message_id };
+        assert_eq!(msg_id, 42);
+    }
+
+    #[test]
+    fn robot_command_to_bytes_roundtrip() {
+        let mut cmd: RobotCommand = unsafe { std::mem::zeroed() };
+        cmd.message_id = 123;
+        cmd.control.tau_j_d[0] = 1.5;
+
+        let bytes = cmd.to_bytes();
+        assert_eq!(bytes.len(), RobotCommand::SIZE);
+
+        let recovered = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RobotCommand) };
+        let msg_id = { recovered.message_id };
+        let tau = { recovered.control.tau_j_d[0] };
+        assert_eq!(msg_id, 123);
+        assert_eq!(tau, 1.5);
+    }
+
+    #[test]
+    fn errors_as_bools_conversion() {
+        let mut state: RawRobotState = unsafe { std::mem::zeroed() };
+        state.errors[0] = 1;
+        state.errors[6] = 1;
+        state.errors[40] = 1;
+
+        let bools = state.errors_as_bools();
+        assert!(bools[0]);
+        assert!(!bools[1]);
+        assert!(bools[6]);
+        assert!(bools[40]);
+    }
+
+    #[test]
+    fn f32_to_f64_conversion() {
+        let src: [f32; 7] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let dst = f32x7_to_f64(src);
+        assert_eq!(dst, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    }
+}

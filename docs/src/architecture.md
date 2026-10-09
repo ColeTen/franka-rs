@@ -7,18 +7,24 @@
 ```mermaid
 graph TD
     subgraph "Public API Layer"
-        ROBOT["Robot<br/>(connect, control_*, read)"]
-        GRIPPER["Gripper<br/>(grasp, move, homing)"]
+        ROBOT["Robot<br/>(connect, control_*, read, start_*_control)"]
+        GRIPPER["Gripper<br/>(homing, grasp, move_fingers)"]
         VACUUM["VacuumGripper<br/>(vacuum, drop_off)"]
-        MODEL["Model<br/>(pose, jacobian, mass, gravity)"]
+        MODEL["Model / RobotModel<br/>(pose, jacobians, mass, coriolis, gravity)"]
         ACTIVE["ActiveTorqueControl<br/>ActiveMotionControl"]
+        CONFIG["robot::config<br/>(MotionConfig, CollisionConfig, LoadConfig)"]
     end
 
     subgraph "Control Layer"
-        CLOOP["ControlLoop<br/>(1 kHz cycle)"]
-        RLIMIT["RateLimiter<br/>(jerk/accel bounds)"]
-        LPFILT["LowPassFilter<br/>(SLERP for rotation)"]
-        LOG["Logger<br/>(ring buffer diagnostics)"]
+        CLOOP["control_loop<br/>(1 kHz loops, start/finish/cancel motion)"]
+        CONV["motion_conversion<br/>(per-motion-type filter, limit, check)"]
+        CTYPES["control_types<br/>(MotionType, MotionResult)"]
+        LPFILT["lowpass_filter"]
+        RLIMIT["rate_limiting"]
+        JVL["joint_velocity_limits<br/>(from the URDF)"]
+        CHECKS["command_checks<br/>(finite, homogeneous, elbow)"]
+        EIGEN["eigen_compat<br/>(libfranka-identical rotation math)"]
+        LOG["logging<br/>(state/command log)"]
     end
 
     subgraph "Transport Layer"
@@ -27,44 +33,62 @@ graph TD
     end
 
     subgraph "Data Layer"
-        TYPES["Types<br/>(JointPositions, CartesianPose, ...)"]
-        WIRE["Wire Structs<br/>(repr C packed)"]
-        ERRORS["Errors<br/>(FrankaError, RobotErrors)"]
-        CONST["Constants<br/>(DH params, limits)"]
+        TYPES["types<br/>(JointPositions, CartesianPose, modes, ...)"]
+        STATE["robot_state<br/>(RobotState)"]
+        WIRE["wire<br/>(repr C packed structs)"]
+        ERRORS["errors<br/>(FrankaError, RobotErrors)"]
+        CONST["constants<br/>(ports, versions, timeouts)"]
     end
 
     ROBOT --> CLOOP
     ROBOT --> NET
     ROBOT --> MODEL
+    ROBOT --> CONFIG
     ACTIVE --> CLOOP
+    ACTIVE --> CONV
     GRIPPER --> NET
     VACUUM --> NET
-    CLOOP --> RLIMIT
+    CLOOP --> CONV
     CLOOP --> LPFILT
+    CLOOP --> RLIMIT
     CLOOP --> LOG
     CLOOP --> NET
+    CONV --> LPFILT
+    CONV --> RLIMIT
+    CONV --> CHECKS
+    CONV --> JVL
+    LPFILT --> EIGEN
+    RLIMIT --> EIGEN
+    RLIMIT --> CHECKS
     NET --> FRAME
     FRAME --> WIRE
-    CLOOP --> TYPES
-    MODEL --> CONST
+    CLOOP --> STATE
+    CTYPES --> CONV
     ROBOT --> ERRORS
+    NET --> CONST
 ```
 
 ## Module Map
 
 | Module | Role | Key Types |
 |--------|------|-----------|
-| `types` | Domain newtypes wrapping raw arrays | `JointPositions`, `Torques`, `CartesianPose`, `Frame` |
+| `types` | Command and mode types | `JointPositions`, `Torques`, `CartesianPose`, `Frame`, `ControllerMode` |
+| `robot_state` | The robot state received every millisecond | `RobotState` |
 | `errors` | Error hierarchy and robot error flags | `FrankaError`, `RobotErrors`, `FrankaResult<T>` |
-| `wire` | Binary packed structs matching the FCI protocol | `RawRobotState`, `RobotCommand`, `CommandHeader` |
+| `wire` (crate-private) | Binary packed structs matching the FCI protocol | `RawRobotState`, `RobotCommand`, `CommandHeader` |
 | `network` | TCP+UDP socket management and framing | `Network`, `connect_robot()` |
-| `control_loop` | 1 kHz real-time loop orchestration | `run_motion_loop()`, `run_torque_loop()` |
-| `rate_limiting` | Joint/Cartesian rate and jerk limiting | `limit_rate_torques()`, `limit_rate_joint_position()` |
-| `lowpass_filter` | Butterworth filter with quaternion SLERP | `lowpass_filter()`, `cartesian_lowpass_filter()` |
-| `logging` | Ring buffer of state/command pairs for diagnostics | `Logger` |
-| `robot` | Main public interface | `Robot` |
-| `active_control` | Non-callback streaming control interface | `ActiveTorqueControl`, `ActiveMotionControl<M>` |
-| `model` | Kinematics (FK, Jacobians) and dynamics (M, C, g) | `Model` |
+| `control_types` | Motion command trait and callback result | `MotionType` (sealed), `MotionResult<T>` |
+| `control_loop` | 1 kHz loops, motion start/finish/cancel | `run_motion_loop()`, `run_torque_loop()` |
+| `motion_conversion` (private) | Converts each motion type to a robot command | `ConvertMotion` |
+| `command_checks` (private) | libfranka's finite, matrix and elbow checks | `check_finite()`, `check_matrix()`, `check_elbow()` |
+| `eigen_compat` (private) | Eigen-identical rotation arithmetic | `affine_rotation()`, `quaternion_slerp()` |
+| `rate_limiting` | Joint/Cartesian rate and jerk limiting (checks inputs) | `limit_rate_torques()`, `limit_rate_joint_positions()` |
+| `lowpass_filter` | First-order low-pass filter, slerp for rotation (checks inputs) | `lowpass_filter()`, `cartesian_lowpass_filter()` |
+| `joint_velocity_limits` | Position-dependent joint velocity limits from the URDF | `JointVelocityLimits` |
+| `logging` | State/command pairs of a successful motion | `Logger`, `LogEntry` |
+| `robot` | Main public interface and its configuration | `Robot`, `MotionConfig`, `CollisionConfig` |
+| `active_control` | Non-callback control interface | `ActiveTorqueControl`, `ActiveMotionControl<M>` |
+| `model` | Kinematics (FK, Jacobians) and dynamics (M, C, g) from the URDF | `Model`, `RobotModel`, `RigidBodyInertia` |
 | `gripper` | Parallel gripper interface | `Gripper`, `GripperState` |
 | `vacuum_gripper` | Vacuum gripper interface | `VacuumGripper`, `VacuumGripperState` |
 
@@ -74,20 +98,21 @@ graph TD
 sequenceDiagram
     participant User as User Callback
     participant CL as Control Loop
-    participant RL as Rate Limiter
     participant LP as Low-Pass Filter
+    participant RL as Rate Limiter
     participant Net as Network (UDP)
     participant Robot as Franka Robot
 
-    loop Every 1ms
+    loop Every 1 ms
         Robot->>Net: RawRobotState (bytes)
         Net->>CL: RobotState (converted)
-        CL->>User: &RobotState, Duration
+        CL->>User: &RobotState, time since last call
         User-->>CL: ControlFlow::Continue(cmd)
-        CL->>RL: Apply rate limits
-        RL-->>CL: Bounded command
-        CL->>LP: Apply low-pass filter
+        CL->>LP: Low-pass filter (if cutoff < 1000 Hz)
         LP-->>CL: Smoothed command
+        CL->>RL: Rate limits (if enabled)
+        RL-->>CL: Bounded command
+        CL->>CL: Final checks (finite, matrix, elbow)
         CL->>Net: RobotCommand (bytes)
         Net->>Robot: UDP packet
     end
@@ -98,20 +123,27 @@ sequenceDiagram
 Rust's borrow checker enforces single-writer access to the robot:
 
 ```rust
+use std::ops::ControlFlow;
+
+use franka_rs::robot::Robot;
+use franka_rs::robot::config::MotionConfig;
+use franka_rs::types::Torques;
+
 // Robot owns the network connection
 let mut robot = Robot::connect("172.16.0.2")?;
 
 // control_torques takes &mut self — no concurrent access possible
-robot.control_torques(|state, duration| {
-    // You have exclusive, safe access to state here
-    ControlFlow::Continue(Torques::new([0.0; 7]))
+robot.control_torques(&MotionConfig::default(), |_state, _period| {
+    ControlFlow::Break(Torques::new([0.0; 7]))
 })?;
 
-// Or use active control (borrows &mut robot for lifetime of control)
+// Or use active control (borrows &mut robot for the lifetime of the session)
 let mut ctrl = robot.start_torque_control()?;
 // robot is now borrowed — can't call robot.read_once() here
-ctrl.write_torques(Torques::new([0.0; 7]))?;
-drop(ctrl); // returns borrow, robot usable again
+ctrl.write_torques(&Torques::new([0.0; 7]))?;
+ctrl.finish(&Torques::new([0.0; 7]))?;
+drop(ctrl); // returns the borrow; robot usable again
 ```
 
-This replaces the C++ approach of runtime mutexes with compile-time guarantees.
+Dropping a session that has not finished cancels the motion (StopMove). This replaces the C++
+approach of runtime mutexes with compile-time guarantees.

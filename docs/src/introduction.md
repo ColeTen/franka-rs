@@ -2,15 +2,24 @@
 
 **Idiomatic Rust interface for the Franka Research 3 robot.**
 
-`franka-rs` is a pure-Rust implementation of the Franka Control Interface (FCI), providing a safe, performant, and ergonomic API for controlling Franka Emika Panda and FR3 robots at 1 kHz.
+`franka-rs` is a Rust implementation of the Franka Control Interface (FCI) client, restructured
+from libfranka 0.21.3 into an idiomatic Rust API, for controlling a Franka Research 3 at 1 kHz.
 
 ## Key Features
 
-- **Pure Rust** — no C/C++ dependencies, no FFI
-- **Type-safe** — leverages Rust's ownership model to prevent concurrent control access
-- **Real-time capable** — synchronous 1 kHz control loop with rate limiting and filtering
-- **Complete** — kinematics, dynamics, motion generation, torque control, gripper interface
-- **Idiomatic** — uses `nalgebra` for linear algebra, `thiserror` for errors, `bitflags` for error states
+- **Rust** — no C++ code; system calls go through `libc` and `socket2`
+- **Type-safe** — the ownership model prevents concurrent control access, and the motion types are
+  checked at compile time
+- **Matches libfranka** — validated against libfranka 0.21.3 (built on the test machine; see
+  `validation/torque_validation_plan.md`): offline against a mock robot, bit-identical commands in
+  every mode and interface, with filtering and rate limiting on and off, and on the error paths; on
+  the robot, identical commands except the message ID for torque, joint position, joint velocity,
+  Cartesian pose and Cartesian velocity control through both interfaces (filtering and rate
+  limiting off, JointImpedance); combined motion + torque offline only
+- **Complete** — kinematics and dynamics from the robot's URDF, motion generation and torque control;
+  gripper and vacuum gripper interfaces exist but have a known protocol issue (see
+  [Gripper Interface](./gripper.md))
+- **Idiomatic** — `nalgebra` for linear algebra, `thiserror` for errors, `bitflags` for error states
 
 ## System Diagram
 
@@ -23,8 +32,8 @@ graph TB
     subgraph "franka-rs"
         ROBOT[Robot]
         CL[Control Loop<br/>1 kHz]
-        RL[Rate Limiter]
         LP[Low-Pass Filter]
+        RL[Rate Limiter]
         NET[Network Layer]
         MODEL[Model<br/>Kinematics & Dynamics]
         GRIP[Gripper]
@@ -36,21 +45,23 @@ graph TB
 
     APP -->|ControlFlow| CL
     ROBOT --> CL
-    CL --> RL
-    RL --> LP
-    LP --> NET
+    CL --> LP
+    LP --> RL
+    RL --> NET
     NET -->|TCP :1337| FCI
     NET -->|UDP 1kHz| FCI
-    MODEL -.->|pose, jacobian, gravity| APP
+    MODEL -.->|pose, jacobian, dynamics| APP
     GRIP -->|TCP :1338| FCI
 ```
 
 ## Quick Example
 
 ```rust
-use franka_rs::robot::Robot;
-use franka_rs::types::{Torques, Frame};
 use std::ops::ControlFlow;
+
+use franka_rs::robot::Robot;
+use franka_rs::robot::config::MotionConfig;
+use franka_rs::types::Torques;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut robot = Robot::connect("172.16.0.2")?;
@@ -59,9 +70,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = robot.read_once()?;
     println!("Joint positions: {:?}", state.q);
 
-    // Gravity compensation (zero-torque control)
-    robot.control_torques(|state, _duration| {
-        ControlFlow::Continue(Torques::new([0.0; 7]))
+    // Zero torques for 5 s: the robot compensates gravity itself (for the end effector as
+    // configured in Desk), so the arm holds if that configuration is accurate.
+    let mut time = 0.0;
+    robot.control_torques(&MotionConfig::default(), |_state, period| {
+        time += period.as_secs_f64();
+        let torques = Torques::new([0.0; 7]);
+        if time >= 5.0 { ControlFlow::Break(torques) } else { ControlFlow::Continue(torques) }
     })?;
 
     Ok(())
@@ -72,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | Robot | Status |
 |-------|--------|
-| Franka Emika Panda | Supported |
-| Franka Research 3 (FR3) | Supported |
+| Franka Research 3 (FR3) | Supported; validated on the robot |
+| Franka Emika Panda | Not tested (franka-rs implements robot protocol version 10, as libfranka 0.21.3) |
 
-Requires **Franka Control Interface (FCI)** firmware. The robot must be in FCI mode (not Desk mode).
+Requires the **Franka Control Interface (FCI)** to be activated in Desk.

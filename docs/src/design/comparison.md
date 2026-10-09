@@ -2,50 +2,53 @@
 
 ## Design Philosophy
 
-`franka-rs` is not a 1:1 port of `libfranka`. It restructures the API to leverage Rust's type system, ownership model, and error handling patterns.
+`franka-rs` is not a 1:1 port of libfranka 0.21.3. It restructures the API around Rust's type
+system, ownership model and error handling, while sending the robot the same bytes. This has been
+validated offline (bit-identical, every mode and interface, filtering and rate limiting on and off,
+error paths) and on the robot (identical except the message ID for the torque and four motion
+modes, both interfaces, filtering and rate limiting off); combined motion + torque offline only.
+See `validation/torque_validation_plan.md`.
 
 ```mermaid
 flowchart TD
     subgraph "libfranka C++"
         CPP_R["franka::Robot"]
-        CPP_M["franka::Model"]
-        CPP_G["franka::Gripper"]
+        CPP_M["franka::Model<br/>(URDF + pinocchio)"]
+        CPP_G["franka::Gripper<br/>franka::VacuumGripper"]
         CPP_EX["franka::Exception"]
         CPP_RS["franka::RobotState"]
         CPP_CMD["franka::Torques<br/>franka::JointPositions<br/>franka::CartesianPose<br/>franka::JointVelocities<br/>franka::CartesianVelocities"]
-        CPP_LIB["libm (model library)<br/>Dynamic .so loading"]
+        CPP_AC["franka::ActiveControlBase"]
     end
 
     subgraph "franka-rs"
         RS_R["Robot"]
-        RS_M["Model"]
+        RS_M["Model + RobotModel<br/>(URDF, pure Rust)"]
         RS_G["Gripper + VacuumGripper"]
         RS_ERR["FrankaError + RobotErrors"]
         RS_RS["RobotState"]
         RS_CMD["Torques, JointPositions,<br/>CartesianPose, etc."]
         RS_AC["ActiveTorqueControl<br/>ActiveMotionControl"]
-        RS_PURE["Pure Rust kinematics<br/>and dynamics"]
     end
 
     CPP_R -.->|"redesigned"| RS_R
     CPP_M -.->|"reimplemented"| RS_M
-    CPP_G -.->|"split"| RS_G
+    CPP_G -.->|"same split"| RS_G
     CPP_EX -.->|"restructured"| RS_ERR
-    CPP_RS -.->|"same fields"| RS_RS
+    CPP_RS -.->|"nearly the same fields"| RS_RS
     CPP_CMD -.->|"newtypes"| RS_CMD
-    CPP_LIB -.->|"eliminated"| RS_PURE
+    CPP_AC -.->|"typed sessions"| RS_AC
 ```
 
 ## Key Differences
 
-### 1. No C/C++ Dependencies
+### 1. Dependencies
 
 | Aspect | libfranka | franka-rs |
 |--------|-----------|-----------|
-| Model library | Dynamic `.so` loaded at runtime | Pure Rust implementation |
+| Model | Built from the robot's URDF with pinocchio | Built from the robot's URDF in Rust |
 | Build system | CMake + C++ compiler | Cargo only |
-| Cross-compilation | Complex (need target `.so`) | Standard Rust cross-compile |
-| Dependencies | Eigen, Poco, libfranka.so | nalgebra, thiserror, bitflags, socket2 |
+| Dependencies | Eigen, Poco, pinocchio, TinyXML2, console_bridge | nalgebra, thiserror, bitflags, socket2, libc, roxmltree |
 
 ### 2. Compile-Time Safety vs. Runtime Checks
 
@@ -54,7 +57,7 @@ flowchart TD
 franka::Robot robot("172.16.0.2");
 // Nothing prevents concurrent access at compile time
 // Runtime mutexes protect shared state
-robot.control([](const franka::RobotState& state, 
+robot.control([](const franka::RobotState& state,
                  franka::Duration period) -> franka::Torques {
     return {{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
 });
@@ -64,7 +67,7 @@ robot.control([](const franka::RobotState& state,
 ```rust
 let mut robot = Robot::connect("172.16.0.2")?;
 // &mut self prevents concurrent access at compile time
-robot.control_torques(&config, |state, duration| {
+robot.control_torques(&MotionConfig::default(), |_state, _period| {
     ControlFlow::Continue(Torques::new([0.0; 7]))
 })?;
 ```
@@ -84,58 +87,66 @@ try {
 **Rust (Result + pattern matching):**
 ```rust
 match robot.control_torques(&config, callback) {
-    Ok(log) => { /* inspect log entries */ }
-    Err(FrankaError::Control { message, log }) => {
+    Ok(log) => { /* Vec<LogEntry> of the motion */ }
+    Err(FrankaError::Control { message, .. }) => {
         eprintln!("{message}");
-        // Structured access to error state
     }
     Err(e) => eprintln!("{e}"),
 }
 ```
 
+`FrankaError::Control` has a `log` field, but franka-rs does not fill it (it is always empty);
+libfranka attaches its recent state/command log to a `ControlException`.
+
 ### 4. Motion Completion Signaling
 
-**C++ (bool `finished` field):**
+**C++ (`motion_finished` field):**
 ```cpp
-// Must set finished = true AND return correct values
-return franka::Torques(tau, /* finished = */ true);
+franka::Torques torques(tau);
+torques.motion_finished = true;
+return torques;
 ```
 
 **Rust (ControlFlow enum):**
 ```rust
-// Type-safe: Break means stop, Continue means keep going
 ControlFlow::Break(Torques::new(tau))    // finished
 ControlFlow::Continue(Torques::new(tau)) // keep going
 ```
 
 ### 5. Active Control (Non-Callback)
 
-libfranka only supports callback-based control. `franka-rs` adds `ActiveTorqueControl` and `ActiveMotionControl` for imperative-style control with RAII cleanup:
+Both libraries offer a non-callback interface (libfranka: `startTorqueControl`,
+`startJointPositionControl`, … returning `ActiveControlBase` with `readOnce`/`writeOnce`).
+franka-rs types the session by its motion type (`ActiveMotionControl<M>`) and ties it to the
+robot's borrow:
 
 ```rust
 let mut ctrl = robot.start_torque_control()?;
+let mut state = ctrl.read_state()?;
 loop {
-    let state = ctrl.read_state()?;
-    ctrl.write_torques(&Torques::new(compute(state)))?;
-    if done() { break; }
+    let tau = Torques::new(compute(&state));
+    if done() {
+        ctrl.finish(&tau)?;
+        break;
+    }
+    state = ctrl.write_torques(&tau)?;
 }
-// ctrl dropped — automatically finishes motion
+// A session dropped without finishing is cancelled (StopMove), as libfranka's destructor does.
 ```
 
 ### 6. Model API
 
-**C++ (requires `.so` file):**
+**C++:**
 ```cpp
-franka::Model model = robot.loadModel();
-// Loads libfrankamodel.so at runtime
-// Fails if library not found
+franka::Model model = robot.loadModel();  // URDF from the robot, pinocchio model
 ```
 
-**Rust (pure computation):**
+**Rust:**
 ```rust
-let model = Model::new();
-// No file loading — kinematics/dynamics computed in Rust
-// Works everywhere, no runtime dependencies
+use franka_rs::model::RobotModel;
+
+let model = robot.load_model()?;  // URDF from the robot, Rust model
+// or Model::from_urdf(&urdf_text)?
 ```
 
 ## API Mapping
@@ -143,27 +154,33 @@ let model = Model::new();
 | libfranka C++ | franka-rs | Notes |
 |---------------|-----------|-------|
 | `franka::Robot` | `Robot` | Same concept |
-| `franka::Robot::control()` | `Robot::control_torques()` | Split by type |
-| `franka::Robot::read()` | `Robot::read()` | Uses `bool` return instead of callback |
+| `franka::Robot::control()` | `Robot::control_torques()`, `control_joint_positions()`, … | Split by type; take a `MotionConfig` |
+| `franka::Robot::read()` | `Robot::read()` | Callback returns `bool` (continue) as in libfranka |
 | `franka::Robot::readOnce()` | `Robot::read_once()` | Same |
-| `franka::Model` | `Model` | Pure Rust, no `.so` |
-| `franka::Gripper` | `Gripper` | Same |
-| — | `VacuumGripper` | Separated from gripper |
-| `franka::RobotState` | `RobotState` | Same fields, `f64` instead of `std::array` |
+| `franka::Robot::startTorqueControl()` … | `Robot::start_torque_control()`, `start_motion_control::<M>()` | Typed sessions |
+| `franka::Model` | `Model` + `RobotModel` trait | From the URDF |
+| `franka::Gripper` | `Gripper` | See the known header issue in [Gripper Interface](../gripper.md) |
+| `franka::VacuumGripper` | `VacuumGripper` | Same API; see the known header issue in [Gripper Interface](../gripper.md) |
+| `franka::RobotState` | `RobotState` | Same fields except `m_total`, `I_total`, `F_x_Ctotal` (use `RobotState::total_load()`); adds `motion_generator_mode` |
 | `franka::Torques` | `Torques` | Newtype with `Deref` |
 | `franka::JointPositions` | `JointPositions` | Newtype with `Deref` |
-| `franka::CartesianPose` | `CartesianPose` | Uses `Isometry3` internally |
+| `franka::CartesianPose` | `CartesianPose` | Same column-major matrix; `Option` elbow; `Isometry3` conversions |
 | `franka::Duration` | `std::time::Duration` | Standard library type |
-| `franka::Exception` | `FrankaError` | Enum with variants |
+| `franka::Exception` and subclasses | `FrankaError` | Enum with variants; `std::invalid_argument` → `InvalidArgument` |
 | `franka::Errors` | `RobotErrors` | `bitflags` crate |
-| — | `ActiveTorqueControl` | New: non-callback control |
-| — | `ActiveMotionControl<M>` | New: non-callback control |
-| `franka::MotionFinished` | `ControlFlow::Break` | Standard library enum |
+| `motion_finished = true` | `ControlFlow::Break` | Standard library enum |
 
-## What's Not (Yet) Implemented
+## Known Behavioral Differences
 
-| Feature | Status |
-|---------|--------|
-| Real-time thread scheduling | API present, enforcement not yet implemented |
-| Automatic controller switching | Planned |
-| FCI firmware auto-detection | Planned |
+These were found by comparing the sources; none affects the validated control sequences.
+
+| Area | libfranka | franka-rs |
+|------|-----------|-----------|
+| Real-time scheduling | `kEnforce` (default) sets the highest thread priority and refuses to connect without a real-time kernel | `RealtimeConfig` is stored only; nothing is set or checked |
+| TCP replies | Waits for a reply without a time limit | Times out after 1 s (`NetworkConfig::tcp_timeout`) with `FrankaError::Network` |
+| UDP state larger than expected | Truncated and accepted | Rejected with `FrankaError::Protocol` |
+| UDP receive error | Shuts the TCP socket down before raising the error | Leaves TCP open (a cancelling StopMove can still be sent) |
+| Unexpected "motion started" reply while a motion runs | Protocol error | Accepted |
+| `load_model` on a mobile robot | Refused before any request | Sends GetRobotModel, then fails to build the model |
+| `ControlException` log | Recent states and commands | `FrankaError::Control::log` is empty |
+| Error type for misuse (finished session, wrong controller, …) | `ControlException` / `std::invalid_argument` | `FrankaError::InvalidOperation` ("start multiple motions" is `FrankaError::Control` in both) |

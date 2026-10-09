@@ -2,59 +2,68 @@
 
 ## Overview
 
-Direct torque control sends joint torques to the robot at 1 kHz. This is the lowest-level control interface, suitable for:
+Torque control sends joint torques to the robot every millisecond (1 kHz). It is the lowest-level
+control interface, suited to impedance and compliance control, force control and custom dynamics
+controllers.
 
-- Gravity compensation
-- Impedance/compliance control
-- Force control
-- Custom dynamics controllers
-- Learning-based control
+The commanded torques are **without gravity and friction**: the robot compensates gravity (for the
+arm and the end effector and load configured in Desk) itself, as libfranka documents for
+`franka::Torques`. A command of zero torques therefore holds the arm against gravity when the
+configured end-effector mass and center of mass are accurate, as libfranka's `communication_test`
+relies on; with an inaccurate configuration the arm can drift. Do not add the model's gravity
+torque to the command; that would compensate gravity twice.
 
 ## Basic Torque Control
 
+The callback receives the robot state and the time since the previous call (normally 1 ms). It
+returns `ControlFlow::Continue(torques)` to keep going or `ControlFlow::Break(torques)` to send the
+final command and stop.
+
 ```rust
-use franka_rs::types::Torques;
-use franka_rs::model::Model;
 use std::ops::ControlFlow;
 
-let model = Model::new();
+use franka_rs::robot::config::MotionConfig;
+use franka_rs::types::Torques;
 
-robot.control_torques(|state, duration| {
-    // Pure gravity compensation
-    let gravity = model.gravity(
-        &state.q,
-        state.m_load,
-        &state.f_x_cload,
-        &[0.0, 0.0, -9.81],
-    );
-
-    if duration.as_secs_f64() >= 10.0 {
-        ControlFlow::Break(Torques::new(gravity))
+// Zero torques for 10 s: the robot compensates gravity, so the arm holds if the end effector is
+// configured accurately in Desk.
+let mut time = 0.0;
+robot.control_torques(&MotionConfig::default(), |_state, period| {
+    time += period.as_secs_f64();
+    let torques = Torques::new([0.0; 7]);
+    if time >= 10.0 {
+        ControlFlow::Break(torques)
     } else {
-        ControlFlow::Continue(Torques::new(gravity))
+        ControlFlow::Continue(torques)
     }
 })?;
 ```
 
+`MotionConfig` selects rate limiting (default on) and the low-pass filter cutoff (default 100 Hz;
+1000 Hz or more turns the filter off). Torque loops always run with the robot's external
+controller, whatever `MotionConfig::controller_mode` says.
+
 ## Impedance Control
 
+A joint impedance law holding the configuration the arm had when the motion started:
+
 ```rust
-let model = Model::new();
+use std::ops::ControlFlow;
+
+use franka_rs::robot::config::MotionConfig;
+use franka_rs::types::Torques;
+
 let stiffness = [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]; // Nm/rad
 let damping = [50.0, 50.0, 50.0, 50.0, 30.0, 25.0, 15.0];         // Nm·s/rad
-let q_desired = robot.read_once()?.q;
+let mut q_desired: Option<[f64; 7]> = None;
+let mut time = 0.0;
 
-robot.control_torques(|state, duration| {
-    let gravity = model.gravity(&state.q, 0.0, &[0.0; 3], &[0.0, 0.0, -9.81]);
-
-    let mut tau = [0.0; 7];
-    for i in 0..7 {
-        tau[i] = gravity[i]
-            + stiffness[i] * (q_desired[i] - state.q[i])
-            - damping[i] * state.dq[i];
-    }
-
-    if duration.as_secs_f64() >= 30.0 {
+robot.control_torques(&MotionConfig::default(), |state, period| {
+    time += period.as_secs_f64();
+    let q_ref = *q_desired.get_or_insert(state.q);
+    let tau: [f64; 7] =
+        std::array::from_fn(|i| stiffness[i] * (q_ref[i] - state.q[i]) - damping[i] * state.dq[i]);
+    if time >= 30.0 {
         ControlFlow::Break(Torques::new(tau))
     } else {
         ControlFlow::Continue(Torques::new(tau))
@@ -64,70 +73,83 @@ robot.control_torques(|state, duration| {
 
 ## Torque Control Pipeline
 
+In the callback interface each torque command is processed as libfranka's control loop does: the
+low-pass filter (if the cutoff is below 1000 Hz), then the rate limiter (if enabled), then a check
+that every value is finite. A non-finite torque, or an invalid cutoff, returns
+`FrankaError::InvalidArgument`; the motion is then cancelled with a StopMove request.
+
 ```mermaid
 flowchart LR
     subgraph "User Controller"
         CTRL[Compute τ]
     end
 
-    subgraph "franka-rs Pipeline"
-        RL["Rate Limiter<br/>(±1000 Nm/s)"]
-        LP["Low-Pass Filter<br/>(100 Hz cutoff)"]
+    subgraph "franka-rs (callback interface)"
+        LP["Low-Pass Filter<br/>(cutoff < 1000 Hz)"]
+        RL["Rate Limiter<br/>(≈1000 Nm/s, if enabled)"]
+        FIN["Finite check"]
         CMD["Pack into<br/>RobotCommand"]
     end
 
     subgraph "Robot"
-        JOINT["Joint Torque<br/>Actuators"]
+        JOINT["Joint torque control<br/>(+ gravity compensation)"]
     end
 
-    CTRL -->|"Torques([f64;7])"| RL
-    RL --> LP
-    LP --> CMD
+    CTRL -->|"Torques([f64; 7])"| LP
+    LP --> RL
+    RL --> FIN
+    FIN --> CMD
     CMD -->|UDP| JOINT
 ```
 
 ## Using the Model for Dynamics Compensation
 
-```mermaid
-flowchart TD
-    STATE["RobotState<br/>(q, dq, τ_ext)"] --> GRAV["model.gravity(q)"]
-    STATE --> CORI["model.coriolis(q, dq)"]
-    STATE --> MASS["model.mass(q)"]
-    STATE --> JAC["model.zero_jacobian(q)"]
+The model gives the arm's kinematics and dynamics at a robot state. Coriolis and mass terms can be
+used in a controller; gravity is already compensated by the robot.
 
-    GRAV --> SUM["τ = g + C·dq + M·ddq_d + K·e + D·ė"]
-    CORI --> SUM
-    MASS --> SUM
-    JAC --> TASK["Task-space force:<br/>τ = J^T · F_task"]
+```rust
+use franka_rs::model::RobotModel;
+use franka_rs::types::Frame;
 
-    SUM --> OUT[Torques]
-    TASK --> OUT
+let model = robot.load_model()?;          // built from the robot's URDF
+let state = robot.read_once()?;
+
+let coriolis: [f64; 7] = model.coriolis_from_state(&state).into(); // N·m
+let c_matrix = model.coriolis_matrix_from_state(&state);         // 7×7, C(q, dq)
+let mass = model.mass_from_state(&state);                        // 7×7, kg·m²
+let jacobian = model.zero_jacobian_from_state(Frame::EndEffector, &state); // 6×7
+// A task-space force F (6-vector) maps to joint torques as jacobian.transpose() * F.
 ```
 
 ## Safety Considerations
 
-- **Always include gravity compensation** — sending zero torques will cause the robot to fall
-- **Start with low gains** — high stiffness/damping can cause instability
-- **Monitor `tau_ext_hat_filtered`** — detects unexpected contacts
-- **The rate limiter caps torque derivative at ±1000 Nm/s** — ensure smooth torque profiles
-- **External torques exceeding collision thresholds trigger protective stops** — configure collision behavior appropriately
+- **Zero torques hold the arm** only when the end effector and load are configured accurately in
+  Desk; the robot adds gravity compensation for the configured values.
+- **Start with low gains**: high stiffness or damping can cause instability.
+- **Monitor `tau_ext_hat_filtered`** to detect unexpected contact.
+- **The rate limiter** (callback interface, when enabled) limits the torque rate to about
+  1000 Nm/s; the active interface sends torques unfiltered and unlimited, after the finite check.
+- **External torques above the collision thresholds trigger a reflex**: configure them with
+  `Robot::set_collision_behavior`.
 
 ## Active Torque Control (Non-Callback)
 
-For integration with external control loops or async frameworks:
+For integration with your own loop: `read_state` returns the latest state, `write_torques` sends
+torques and returns the next state, and `finish` sends the final torques and ends the motion.
 
 ```rust
+use franka_rs::types::Torques;
+
 let mut ctrl = robot.start_torque_control()?;
-
+let mut state = ctrl.read_state()?;
 loop {
-    let state = ctrl.read_state()?;
-    let tau = compute_my_torques(&state);
-
-    if should_stop() {
-        ctrl.write_torques_finish(Torques::new(tau))?;
+    let tau = Torques::new(compute_my_torques(&state));
+    if should_stop(&state) {
+        ctrl.finish(&tau)?;
         break;
     }
-    ctrl.write_torques(Torques::new(tau))?;
+    state = ctrl.write_torques(&tau)?;
 }
-// ctrl is dropped here — sends stop command automatically (RAII)
+// Dropping a session that was not finished (an error, a `?` or a panic) cancels the motion with
+// a StopMove request; after a successful `finish` nothing more is sent.
 ```
