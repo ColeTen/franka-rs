@@ -1,6 +1,7 @@
 mod command;
 mod framing;
 mod handshake;
+mod header;
 
 pub use command::RobotCommand;
 pub use handshake::{connect_gripper, connect_robot, connect_vacuum_gripper};
@@ -20,6 +21,10 @@ use crate::errors::{FrankaError, FrankaResult};
 use crate::wire::robot::CommandHeader;
 
 use self::framing::TcpFraming;
+use self::header::MessageHeader;
+
+/// Size of the stack buffer header bytes are read into; at least every protocol's header size.
+const HEADER_BUFFER_SIZE: usize = 16;
 
 /// Configuration for the network connection.
 #[derive(Debug, Clone)]
@@ -47,7 +52,9 @@ impl Default for NetworkConfig {
 ///
 /// TCP is used for command/response messages (connection setup, motion start, configuration).
 /// UDP is used for high-frequency robot state and control command exchange during the control loop.
-pub struct Network {
+/// TCP messages start with the header `H` of the protocol spoken: the robot's by default, the
+/// gripper's or vacuum gripper's for those devices.
+pub struct Network<H = CommandHeader> {
     tcp: TcpStream,
     udp: UdpSocket,
     udp_port: u16,
@@ -71,13 +78,20 @@ pub struct Network {
     /// Motion generator and controller modes (robot-state numbering) the running Move requested.
     current_move_modes: Cell<Option<(u8, u8)>>,
     next_command_id: u32,
-    framing: TcpFraming,
+    framing: TcpFraming<H>,
     received_responses: HashMap<u32, Vec<u8>>,
 }
 
 impl Network {
     /// Connect to a robot at the given address and port.
     pub fn connect(address: &str, port: u16, config: &NetworkConfig) -> FrankaResult<Self> {
+        Self::connect_with_header(address, port, config)
+    }
+}
+
+impl<H: MessageHeader> Network<H> {
+    /// Connect to a device at the given address and port whose TCP messages use the header `H`.
+    pub fn connect_with_header(address: &str, port: u16, config: &NetworkConfig) -> FrankaResult<Self> {
         let tcp_addr = format!("{address}:{port}");
         let robot_addr: SocketAddr = tcp_addr
             .parse()
@@ -179,20 +193,14 @@ impl Network {
     }
 
     /// Send a TCP request and return the assigned command ID.
-    pub fn tcp_send_request(&mut self, command: u32, payload: &[u8]) -> FrankaResult<u32> {
+    pub fn tcp_send_request(&mut self, command: H::Command, payload: &[u8]) -> FrankaResult<u32> {
         let command_id = self.next_command_id;
         self.next_command_id += 1;
 
-        let total_size = (CommandHeader::SIZE + payload.len()) as u32;
-        let header = CommandHeader {
-            command,
-            command_id,
-            size: total_size,
-        };
+        let total_size = (H::SIZE + payload.len()) as u32;
 
         // Header and payload go out in one write so the request leaves as a single segment.
-        let mut message = Vec::with_capacity(total_size as usize);
-        message.extend_from_slice(&header.to_bytes());
+        let mut message = H::encode(command, command_id, total_size);
         message.extend_from_slice(payload);
         self.tcp
             .write_all(&message)
@@ -307,7 +315,7 @@ impl Network {
     fn tcp_read_message(&mut self) -> FrankaResult<()> {
         // Read the header, continuing any header bytes a non-blocking read left behind.
         while self.framing.header_bytes_needed() > 0 {
-            let mut header_buf = [0u8; CommandHeader::SIZE];
+            let mut header_buf = [0u8; HEADER_BUFFER_SIZE];
             let needed = self.framing.header_bytes_needed();
             let n = self
                 .tcp
@@ -343,7 +351,7 @@ impl Network {
         // Header bytes that arrive split across reads are kept in the framing state, so a
         // would-block in the middle of a header loses nothing.
         while self.framing.header_bytes_needed() > 0 {
-            let mut header_buf = [0u8; CommandHeader::SIZE];
+            let mut header_buf = [0u8; HEADER_BUFFER_SIZE];
             let needed = self.framing.header_bytes_needed();
             match tcp_receive_nonblocking(&self.tcp, &mut header_buf[..needed], 0) {
                 Ok(0) => return Err(FrankaError::network("server closed connection")),
@@ -383,7 +391,7 @@ fn as_uninit(buf: &mut [u8]) -> &mut [MaybeUninit<u8>] {
     unsafe { &mut *(buf as *mut [u8] as *mut [MaybeUninit<u8>]) }
 }
 
-impl Drop for Network {
+impl<H> Drop for Network<H> {
     fn drop(&mut self) {
         let _ = self.tcp.shutdown(std::net::Shutdown::Both);
     }

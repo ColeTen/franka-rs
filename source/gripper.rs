@@ -20,7 +20,7 @@ pub struct GripperState {
 ///
 /// Connects to the gripper on port 1338 (same IP as the robot).
 pub struct Gripper {
-    network: Network,
+    network: Network<gripper::CommandHeader>,
     server_version: u16,
 }
 
@@ -28,7 +28,7 @@ impl Gripper {
     /// Connect to the gripper at the given robot address.
     pub fn connect(address: &str) -> FrankaResult<Self> {
         let config = NetworkConfig::default();
-        let mut network = Network::connect(address, GRIPPER_COMMAND_PORT, &config)?;
+        let mut network = Network::connect_with_header(address, GRIPPER_COMMAND_PORT, &config)?;
         let server_version = network::connect_gripper(&mut network)?;
 
         Ok(Self {
@@ -124,7 +124,7 @@ impl Gripper {
     ) -> FrankaResult<bool> {
         let command_id = self
             .network
-            .tcp_send_request(command as u16 as u32, payload)?;
+            .tcp_send_request(command as u16, payload)?;
         let response_bytes = self.network.tcp_blocking_receive_response(command_id)?;
 
         let status = parse_gripper_status(&response_bytes)?;
@@ -163,4 +163,62 @@ fn struct_to_bytes<T: Copy>(value: &T) -> Vec<u8> {
         std::ptr::copy_nonoverlapping(value as *const T as *const u8, bytes.as_mut_ptr(), size);
     }
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    /// Encodes a gripper message: the 10-byte header followed by `payload`.
+    fn message(command: u16, command_id: u32, payload: &[u8]) -> Vec<u8> {
+        let size = (gripper::CommandHeader::SIZE + payload.len()) as u32;
+        let mut bytes = gripper::CommandHeader { command, command_id, size }.to_bytes().to_vec();
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    /// Reads exactly `length` bytes from `stream`.
+    fn read_exact(stream: &mut impl Read, length: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; length];
+        stream.read_exact(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn connect_and_homing_use_the_gripper_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let connect_request = read_exact(&mut stream, 14);
+            stream.write_all(&message(0, 0, &[0, 0, 3, 0])).unwrap(); // Success, version 3
+            let homing_request = read_exact(&mut stream, 10);
+            stream.write_all(&message(1, 1, &[0, 0])).unwrap(); // Success
+            (connect_request, homing_request)
+        });
+
+        let mut network =
+            Network::<gripper::CommandHeader>::connect_with_header("127.0.0.1", port, &NetworkConfig::default())
+                .unwrap();
+        let udp_port = network.udp_port();
+        let server_version = network::connect_gripper(&mut network).unwrap();
+        let mut gripper = Gripper { network, server_version };
+        assert_eq!(gripper.server_version(), crate::constants::GRIPPER_PROTOCOL_VERSION);
+        assert!(gripper.homing().unwrap());
+
+        let (connect_request, homing_request) = server.join().unwrap();
+        let mut connect_payload = crate::constants::GRIPPER_PROTOCOL_VERSION.to_ne_bytes().to_vec();
+        connect_payload.extend_from_slice(&udp_port.to_ne_bytes());
+        assert_eq!(connect_request, message(0, 0, &connect_payload));
+        assert_eq!(homing_request, message(1, 1, &[]));
+    }
+
+    #[test]
+    fn status_is_read_after_the_gripper_header() {
+        assert_eq!(parse_gripper_status(&message(3, 0, &[2, 0])).unwrap(), GripperStatus::Unsuccessful);
+        assert!(parse_gripper_status(&message(3, 0, &[])).is_err());
+    }
 }

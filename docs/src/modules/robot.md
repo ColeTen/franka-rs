@@ -1,256 +1,84 @@
 # Robot API
 
-## Overview
+`Robot` owns the connection and provides state reading, configuration, and control.
 
-The `Robot` struct is the primary entry point for interacting with a Franka robot. It owns the network connection and provides state reading, configuration, and motion/torque control.
+| Group | Methods |
+|-------|---------|
+| Connection | `connect(address)`, `connect_with_config(address, RealtimeConfig)`, `server_version()`, `realtime_config()` |
+| State | `read_once()`, `read(callback)` |
+| Callback control | `control_joint_positions`, `control_joint_velocities`, `control_cartesian_pose`, `control_cartesian_velocities`, `control_torques`, `control_motion_with_torques` |
+| Active control | `start_torque_control()`, `start_motion_control::<M>(ControllerMode)` |
+| Configuration | `set_collision_behavior`, `set_joint_impedance`, `set_cartesian_impedance`, `set_guiding_mode`, `set_k_frame`, `set_ee_frame`, `set_load`, `automatic_error_recovery`, `stop` |
+| Model | `get_robot_model()` (URDF text), `load_model()` (`Model`) |
 
-```mermaid
-classDiagram
-    class Robot {
-        -Network network
-        -u16 server_version
-        -RealtimeConfig realtime_config
-        -JointVelocityLimits joint_velocity_limits
-        +connect(address) FrankaResult~Self~
-        +connect_with_config(address, rt_config) FrankaResult~Self~
-        +server_version() u16
-        +realtime_config() RealtimeConfig
-    }
-
-    class Robot_State_Reading {
-        +read_once() FrankaResult~RobotState~
-        +read(callback) FrankaResult~()~
-    }
-
-    class Robot_Motion_Control {
-        +control_joint_positions(&config, callback) FrankaResult~Vec~LogEntry~~
-        +control_joint_velocities(&config, callback) FrankaResult~Vec~LogEntry~~
-        +control_cartesian_pose(&config, callback) FrankaResult~Vec~LogEntry~~
-        +control_cartesian_velocities(&config, callback) FrankaResult~Vec~LogEntry~~
-        +control_torques(&config, callback) FrankaResult~Vec~LogEntry~~
-        +control_motion_with_torques~M~(&config, motion_cb, ctrl_cb) FrankaResult~Vec~LogEntry~~
-    }
-
-    class Robot_Configuration {
-        +set_collision_behavior(&config) FrankaResult~()~
-        +set_joint_impedance(k_theta) FrankaResult~()~
-        +set_cartesian_impedance(k_x) FrankaResult~()~
-        +set_guiding_mode(axes, elbow_free) FrankaResult~()~
-        +set_k_frame(ee_t_k) FrankaResult~()~
-        +set_ee_frame(ne_t_ee) FrankaResult~()~
-        +set_load(&config) FrankaResult~()~
-        +automatic_error_recovery() FrankaResult~()~
-        +stop() FrankaResult~()~
-        +get_robot_model() FrankaResult~String~
-        +load_model() FrankaResult~Model~
-    }
-
-    class Robot_Active_Control {
-        +start_torque_control() ActiveTorqueControl
-        +start_motion_control~M~(mode) ActiveMotionControl~M~
-    }
-
-    Robot -- Robot_State_Reading
-    Robot -- Robot_Motion_Control
-    Robot -- Robot_Configuration
-    Robot -- Robot_Active_Control
-
-    Robot --> Network : owns
-```
+All fallible methods return `FrankaResult`.
 
 ## Connection
 
 ```rust
-use franka_rs::robot::Robot;
-use franka_rs::types::RealtimeConfig;
-
-// Uses RealtimeConfig::Ignore
-let mut robot = Robot::connect("172.16.0.2")?;
-
-// Explicit realtime configuration (stored only; see Connecting to the Robot)
-let mut robot = Robot::connect_with_config(
-    "172.16.0.2",
-    RealtimeConfig::Enforce,
-)?;
-
-println!("Server version: {}", robot.server_version());
+let robot = Robot::connect("172.16.0.2")?;  // RealtimeConfig::Ignore
+let robot = Robot::connect_with_config("172.16.0.2", RealtimeConfig::Enforce)?; // stored only
 ```
 
-`connect` performs the handshake, waits for the first state, and downloads the robot's URDF to
-read its joint velocity limits, which the joint position and velocity loops use for rate limiting.
-`load_model` downloads the URDF again and builds a `Model`.
+`connect` takes an IP address (not a hostname), performs the handshake, waits for the first state,
+and downloads the URDF to read the joint velocity limits used by joint rate limiting (for a mobile
+robot's URDF, whose robot name starts with `tmr`, the limits stay all zero). See
+[Connecting](../connecting.md).
 
 ## State Reading
 
-### `read_once`
+- `read_once()` returns the newest received state if it is newer than the last one read;
+  otherwise it waits for the next.
+- `read(callback)` calls `callback(&state)` for each new state until it returns `false`.
 
-Returns the newest state already received if it is newer than the last one read; otherwise waits for the next state:
-
-```rust
-let state = robot.read_once()?;
-println!("Joint positions: {:?}", state.q);
-println!("Mode: {:?}", state.robot_mode);
-```
-
-### `read`
-
-Continuous reading with a callback. Returns when callback returns `false`:
+## Callback Control
 
 ```rust
-use franka_rs::types::RobotMode;
-
-robot.read(|state| {
-    println!("q[0] = {:.4}", state.q[0]);
-    state.robot_mode == RobotMode::Idle // continue while idle
-})?;
-```
-
-## Motion Control
-
-All motion methods take a `MotionConfig` and a callback:
-
-```rust
-use franka_rs::robot::config::MotionConfig;
-use franka_rs::types::ControllerMode;
-
-// Default config: JointImpedance, rate limiting on, 100 Hz filter
-let config = MotionConfig::default();
-
-// Custom config
-let config = MotionConfig::default()
+let config = MotionConfig::default()                       // JointImpedance, limiting on, 100 Hz
     .with_controller_mode(ControllerMode::CartesianImpedance)
     .with_rate_limiting(false)
-    .with_cutoff_frequency(50.0);
+    .with_cutoff_frequency(50.0);                          // ≥ 1000 Hz: filter off
 ```
 
-### Available Control Methods
+| Method | Command | Controller |
+|--------|---------|------------|
+| `control_joint_positions` | `JointPositions` | `config.controller_mode` (internal) |
+| `control_joint_velocities` | `JointVelocities` | internal |
+| `control_cartesian_pose` | `CartesianPose` | internal |
+| `control_cartesian_velocities` | `CartesianVelocities` | internal |
+| `control_torques` | `Torques` | external |
+| `control_motion_with_torques` | `M` + `Torques` (two callbacks) | external |
 
-| Method | Output Type | Internal Controller |
-|--------|-------------|-------------------|
-| `control_joint_positions` | `JointPositions` | Yes (`config.controller_mode`) |
-| `control_joint_velocities` | `JointVelocities` | Yes |
-| `control_cartesian_pose` | `CartesianPose` | Yes |
-| `control_cartesian_velocities` | `CartesianVelocities` | Yes |
-| `control_torques` | `Torques` | No (external) |
-| `control_motion_with_torques` | `M` + `Torques` (two callbacks) | No (external) |
+- Callbacks are `FnMut(&RobotState, Duration) -> ControlFlow<T, T>`; the `Duration` is the time
+  since the previous call (zero on the first call, then normally 1 ms). `Continue(cmd)` keeps
+  going, `Break(cmd)` finishes.
+- Success returns the motion's `Vec<LogEntry>`; on an error the motion is cancelled (StopMove).
+- Motion-only methods return `InvalidOperation` for `ExternalController`.
+- `&mut self` keeps `robot` unusable inside the callback and while an active session exists.
 
-The motion-only methods return `FrankaError::InvalidOperation` if `config.controller_mode` is
-`ExternalController`. All callbacks have the signature:
-
-```rust
-FnMut(&RobotState, Duration) -> ControlFlow<T, T>
-```
-
-The `Duration` is the time since the previous call (normally 1 ms). Return
-`ControlFlow::Continue(cmd)` to keep running, `ControlFlow::Break(cmd)` to send the final command
-and stop. On success the methods return the motion's log (`Vec<LogEntry>`); on an error the motion
-is cancelled (StopMove) and the error returned.
-
-### Ownership Guarantee
-
-Control methods take `&mut self`, which the Rust borrow checker enforces at compile time:
+## Configuration
 
 ```rust
-let mut robot = Robot::connect("172.16.0.2")?;
+// Contact (lower) and collision (upper) thresholds: joint torques (Nm), Cartesian forces (N, Nm)
+robot.set_collision_behavior(&CollisionConfig::symmetric([20.0; 7], [40.0; 7], [20.0; 6], [40.0; 6]))?;
 
-// This compiles — exclusive access while the call runs
-robot.control_torques(&config, |state, _| { /* ... */ })?;
+robot.set_joint_impedance([600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0])?; // Nm/rad, 0–14250
+robot.set_cartesian_impedance([3000.0, 3000.0, 3000.0, 300.0, 300.0, 300.0])?; // 10–3000 N/m, 1–300 Nm/rad
 
-// Inside the callback, `robot` cannot be used (it is mutably borrowed); the same holds while an
-// ActiveTorqueControl or ActiveMotionControl exists:
-let ctrl = robot.start_torque_control()?;
-// let state = robot.read_once(); // ← borrow checker error while `ctrl` is alive
-```
+// Load: mass (kg), center of mass in the flange frame (m), inertia (kg·m², column-major)
+robot.set_load(&LoadConfig::new(0.5, [0.0, 0.0, 0.05], [0.001, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 0.0, 0.001]))?;
 
-## Configuration Commands
-
-### Collision Behavior
-
-```rust
-use franka_rs::robot::config::CollisionConfig;
-
-let collision = CollisionConfig::symmetric(
-    [20.0; 7],  // lower torque thresholds (Nm) — contact detection
-    [40.0; 7],  // upper torque thresholds (Nm) — collision detection
-    [20.0; 6],  // lower force thresholds (N/Nm)
-    [40.0; 6],  // upper force thresholds (N/Nm)
-);
-robot.set_collision_behavior(&collision)?;
-```
-
-### Joint Impedance
-
-```rust
-// Stiffness values in Nm/rad, range [0, 14250] (libfranka's documented range)
-robot.set_joint_impedance([600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0])?;
-```
-
-### Cartesian Impedance
-
-```rust
-// [x, y, z, roll, pitch, yaw]
-// Linear: [10, 3000] N/m. Rotational: [1, 300] Nm/rad
-robot.set_cartesian_impedance([3000.0, 3000.0, 3000.0, 300.0, 300.0, 300.0])?;
-```
-
-### Load Configuration
-
-```rust
-use franka_rs::robot::config::LoadConfig;
-
-let load = LoadConfig::new(
-    0.5,                  // mass (kg)
-    [0.0, 0.0, 0.05],    // center of mass in flange frame (m)
-    [0.001, 0.0, 0.0,    // inertia tensor (kg·m²)
-     0.0, 0.001, 0.0,
-     0.0, 0.0, 0.001],
-);
-robot.set_load(&load)?;
-```
-
-### Guiding Mode
-
-```rust
-// Unlock all Cartesian axes for hand-guiding
-robot.set_guiding_mode([true; 6], true)?;
-
-// Unlock only Z translation and rotation around Z
-robot.set_guiding_mode([false, false, true, false, false, true], false)?;
-```
-
-### Error Recovery
-
-```rust
+robot.set_guiding_mode([false, false, true, false, false, true], false)?; // free z and yaw; elbow locked
+robot.set_k_frame(ee_t_k)?;    // EE_T_K: stiffness frame in the end-effector frame, column-major [f64; 16]
+robot.set_ee_frame(ne_t_ee)?;  // NE_T_EE: end effector in the nominal end-effector frame, column-major [f64; 16]
 robot.automatic_error_recovery()?;
+robot.stop()?;                 // stop all running motions
 ```
 
-### Stop
+`CollisionConfig::symmetric` uses the same thresholds for the acceleration and nominal phases;
+the struct's eight fields set them separately. The impedance ranges are libfranka's documented
+ones.
 
-```rust
-robot.stop()?;
-```
-
-## Configuration Summary
-
-```mermaid
-flowchart TD
-    subgraph "MotionConfig"
-        MC_CM["controller_mode<br/>JointImpedance (default)"]
-        MC_RL["limit_rate<br/>true (default)"]
-        MC_CF["cutoff_frequency<br/>100.0 Hz (default)"]
-    end
-
-    subgraph "CollisionConfig"
-        CC_LT["lower_torque_thresholds"]
-        CC_UT["upper_torque_thresholds"]
-        CC_LF["lower_force_thresholds"]
-        CC_UF["upper_force_thresholds"]
-        CC_NOTE["Each has _acceleration and<br/>_nominal variants"]
-    end
-
-    subgraph "LoadConfig"
-        LC_M["mass (kg)"]
-        LC_COM["center_of_mass [f64; 3]"]
-        LC_I["inertia [f64; 9]"]
-    end
-```
+Motions are started with libfranka's defaults: maximum path and goal deviations of 10.0
+(translation), 3.12 (rotation) and 2π (elbow) (`DEFAULT_DEVIATION_*`), no asynchronous motion
+generator. `network::RobotCommand` is the low-level helper that sends these TCP commands.

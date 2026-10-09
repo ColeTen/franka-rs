@@ -48,7 +48,7 @@ pub fn connect_robot(network: &mut Network) -> FrankaResult<u16> {
 }
 
 /// Perform the gripper connection handshake.
-pub fn connect_gripper(network: &mut Network) -> FrankaResult<u16> {
+pub fn connect_gripper(network: &mut Network<crate::wire::gripper::CommandHeader>) -> FrankaResult<u16> {
     use crate::wire::gripper;
 
     let request = gripper::ConnectRequest {
@@ -58,7 +58,7 @@ pub fn connect_gripper(network: &mut Network) -> FrankaResult<u16> {
 
     let payload = request_to_bytes(&request);
     let command_id =
-        network.tcp_send_request(gripper::Command::Connect as u16 as u32, &payload)?;
+        network.tcp_send_request(gripper::Command::Connect as u16, &payload)?;
 
     let response_bytes = network.tcp_blocking_receive_response(command_id)?;
 
@@ -90,7 +90,9 @@ pub fn connect_gripper(network: &mut Network) -> FrankaResult<u16> {
 }
 
 /// Perform the vacuum gripper connection handshake.
-pub fn connect_vacuum_gripper(network: &mut Network) -> FrankaResult<u16> {
+pub fn connect_vacuum_gripper(
+    network: &mut Network<crate::wire::vacuum::CommandHeader>,
+) -> FrankaResult<u16> {
     use crate::wire::vacuum;
 
     let request = vacuum::ConnectRequest {
@@ -100,7 +102,7 @@ pub fn connect_vacuum_gripper(network: &mut Network) -> FrankaResult<u16> {
 
     let payload = request_to_bytes(&request);
     let command_id =
-        network.tcp_send_request(vacuum::Command::Connect as u16 as u32, &payload)?;
+        network.tcp_send_request(vacuum::Command::Connect as u16, &payload)?;
 
     let response_bytes = network.tcp_blocking_receive_response(command_id)?;
 
