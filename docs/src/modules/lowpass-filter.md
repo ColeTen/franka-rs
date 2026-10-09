@@ -2,7 +2,9 @@
 
 ## Overview
 
-The `lowpass_filter` module provides first-order IIR low-pass filtering for smoothing control commands before transmission to the robot. It handles both scalar/joint-level signals (standard IIR) and Cartesian transformations (SLERP for rotation).
+The `lowpass_filter` module provides libfranka's first-order low-pass filter for smoothing control commands before transmission to the robot. It handles scalar and joint-level signals, and Cartesian transformations (slerp for rotation). Its outputs are bit-identical to libfranka 0.21.3 as built on the test machine (another libfranka build can round differently) (`tests/computation_test.rs`).
+
+Every function checks its inputs, as libfranka's do, and returns `FrankaError::InvalidArgument` for a negative or non-finite sample time, a cutoff frequency that is not positive and finite, or a non-finite current or last value (for poses, any of the 16 values). All return `FrankaResult`.
 
 ```mermaid
 flowchart LR
@@ -25,7 +27,7 @@ flowchart LR
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `MAX_CUTOFF_FREQUENCY` | 1000.0 Hz | Above this, filter is bypassed |
+| `MAX_CUTOFF_FREQUENCY` | 1000.0 Hz | The control loops filter only when the cutoff is below this (a NaN cutoff also skips the filter) |
 | `DEFAULT_CUTOFF_FREQUENCY` | 100.0 Hz | Default cutoff frequency |
 
 ## Filter Gain
@@ -45,7 +47,7 @@ Where:
 | 0.001 | ~0.000006 | Nearly holds previous value |
 | 10 | ~0.059 | Heavy smoothing |
 | 100 | ~0.386 | Moderate smoothing (default) |
-| 1000 | ~0.863 | Light smoothing |
+| 1000 | ~0.863 | (Not applied in the control loops) |
 | 100,000 | ~0.998 | Nearly passthrough |
 
 ## Public Functions
@@ -58,9 +60,9 @@ Single scalar value:
 let filtered = lowpass_filter(
     0.001,   // sample_time (1 kHz)
     10.0,    // current value
-    5.0,     // previous filtered value
+    5.0,     // last value
     100.0,   // cutoff frequency (Hz)
-);
+)?;
 // filtered ≈ 0.386 * 10.0 + 0.614 * 5.0 ≈ 6.93
 ```
 
@@ -72,9 +74,9 @@ All 7 joints in one call:
 let filtered = lowpass_filter_joints(
     0.001,           // sample_time
     &commanded,      // current [f64; 7]
-    &last_filtered,  // previous [f64; 7]
+    &last,           // last [f64; 7]
     100.0,           // cutoff frequency
-);
+)?;
 ```
 
 ### `cartesian_lowpass_filter`
@@ -85,14 +87,14 @@ Filters a 4x4 homogeneous transformation matrix with proper SO(3) handling:
 let filtered = cartesian_lowpass_filter(
     0.001,           // sample_time
     &commanded_pose, // current [f64; 16] column-major
-    &last_pose,      // previous [f64; 16] column-major
+    &last_pose,      // last [f64; 16] column-major
     100.0,           // cutoff frequency
-);
+)?;
 ```
 
 ## Cartesian Filter Detail
 
-The Cartesian filter separates translation and rotation to avoid gimbal lock and ensure smooth interpolation:
+The Cartesian filter separates translation and rotation. Each rotation is taken as Eigen's `Affine3d::rotation()` does (polar decomposition by a Jacobi SVD) and converted to a quaternion; the result is normalized and converted back. This arithmetic, in `eigen_compat`, reproduces libfranka's exactly. The result keeps the current pose's other entries, including its last row:
 
 ```mermaid
 flowchart TD
@@ -103,9 +105,9 @@ flowchart TD
 
     subgraph "Decompose"
         CMD --> CMD_T["Translation<br/>Vector3"]
-        CMD --> CMD_R["Rotation<br/>Matrix3 → UnitQuaternion"]
+        CMD --> CMD_R["Rotation<br/>SVD rotation → quaternion"]
         LAST --> LAST_T["Translation<br/>Vector3"]
-        LAST --> LAST_R["Rotation<br/>Matrix3 → UnitQuaternion"]
+        LAST --> LAST_R["Rotation<br/>SVD rotation → quaternion"]
     end
 
     subgraph "Filter"
@@ -113,11 +115,12 @@ flowchart TD
         LAST_T --> LERP
         CMD_R --> SLERP["Spherical LERP<br/>q_filtered = slerp(q_last, q_cmd, α)"]
         LAST_R --> SLERP
+        SLERP --> NORM["Normalize → rotation matrix"]
     end
 
     subgraph "Reconstruct"
         LERP --> OUT["Filtered pose<br/>[f64; 16]"]
-        SLERP --> OUT
+        NORM --> OUT
     end
 ```
 
@@ -125,7 +128,7 @@ flowchart TD
 
 ## Usage in the Control Loop
 
-The filter is applied automatically during `run_motion_loop` / `run_torque_loop` when `cutoff_frequency < MAX_CUTOFF_FREQUENCY` (1000 Hz):
+The control loops (`run_motion_loop`, `run_torque_loop`, `run_motion_with_control_loop`) filter each command when `cutoff_frequency < MAX_CUTOFF_FREQUENCY` (1000 Hz). The last value is the robot's last commanded value from the state (on the first cycle of a joint position or pose motion, the command itself). The active interface does not filter.
 
 ```rust
 // Filter enabled (default: 100 Hz cutoff)
@@ -145,7 +148,7 @@ let config = MotionConfig::default()
 The filter is applied **before** rate limiting in the pipeline:
 
 ```
-User command → Low-pass filter → Rate limiter → Send to robot
+User command → Low-pass filter → Rate limiter → Final checks → Send to robot
 ```
 
 This order ensures that:

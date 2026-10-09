@@ -111,6 +111,35 @@ int main() {
          AutomaticErrorRecovery::Status::kEmergencyAborted);
   STATUS(AutomaticErrorRecoveryStatus, Aborted, AutomaticErrorRecovery::Status::kAborted);
 
+  // Mode values the robot state reports.
+  STATUS(RobotMode, Other, RobotMode::kOther);
+  STATUS(RobotMode, Idle, RobotMode::kIdle);
+  STATUS(RobotMode, Move, RobotMode::kMove);
+  STATUS(RobotMode, Guiding, RobotMode::kGuiding);
+  STATUS(RobotMode, Reflex, RobotMode::kReflex);
+  STATUS(RobotMode, UserStopped, RobotMode::kUserStopped);
+  STATUS(RobotMode, AutomaticErrorRecovery, RobotMode::kAutomaticErrorRecovery);
+  STATUS(ControllerMode, JointImpedance, ControllerMode::kJointImpedance);
+  STATUS(ControllerMode, CartesianImpedance, ControllerMode::kCartesianImpedance);
+  STATUS(ControllerMode, ExternalController, ControllerMode::kExternalController);
+  STATUS(ControllerMode, Other, ControllerMode::kOther);
+  STATUS(MotionGeneratorMode, Idle, MotionGeneratorMode::kIdle);
+  STATUS(MotionGeneratorMode, JointPosition, MotionGeneratorMode::kJointPosition);
+  STATUS(MotionGeneratorMode, JointVelocity, MotionGeneratorMode::kJointVelocity);
+  STATUS(MotionGeneratorMode, CartesianPosition, MotionGeneratorMode::kCartesianPosition);
+  STATUS(MotionGeneratorMode, CartesianVelocity, MotionGeneratorMode::kCartesianVelocity);
+  STATUS(MotionGeneratorMode, None, MotionGeneratorMode::kNone);
+
+  // Mode values a Move request carries (numbered differently from the robot state's modes).
+  STATUS(MoveControllerMode, JointImpedance, Move::ControllerMode::kJointImpedance);
+  STATUS(MoveControllerMode, CartesianImpedance, Move::ControllerMode::kCartesianImpedance);
+  STATUS(MoveControllerMode, ExternalController, Move::ControllerMode::kExternalController);
+  STATUS(MoveMotionGeneratorMode, JointPosition, Move::MotionGeneratorMode::kJointPosition);
+  STATUS(MoveMotionGeneratorMode, JointVelocity, Move::MotionGeneratorMode::kJointVelocity);
+  STATUS(MoveMotionGeneratorMode, CartesianPosition, Move::MotionGeneratorMode::kCartesianPosition);
+  STATUS(MoveMotionGeneratorMode, CartesianVelocity, Move::MotionGeneratorMode::kCartesianVelocity);
+  STATUS(MoveMotionGeneratorMode, None, Move::MotionGeneratorMode::kNone);
+
   // TCP command channel: the fixed-size request/response payloads.
   record("size.CommandHeader", sizeof(CommandHeader));
   record("size.ConnectRequest", sizeof(Connect::Request));

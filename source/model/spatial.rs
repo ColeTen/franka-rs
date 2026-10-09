@@ -4,7 +4,7 @@
 //! transforms are `nalgebra::Isometry3` values mapping child coordinates to parent
 //! coordinates.
 
-use nalgebra::{Isometry3, Matrix3, Vector3};
+use nalgebra::{Isometry3, Matrix3, Matrix6, Vector3, Vector6};
 
 /// Mass properties of a rigid body.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -78,6 +78,39 @@ impl RigidBodyInertia {
         )
     }
 
+    /// Returns this inertia as a 6×6 matrix mapping a motion `[linear; angular]` to its momentum
+    /// `[linear; angular]` (pinocchio's `Inertia::matrix`).
+    pub(crate) fn spatial_matrix(&self) -> Matrix6<f64> {
+        let lever = self.center_of_mass.cross_matrix();
+        let mut matrix = Matrix6::zeros();
+        matrix.fixed_view_mut::<3, 3>(0, 0).copy_from(&(self.mass * Matrix3::identity()));
+        matrix.fixed_view_mut::<3, 3>(0, 3).copy_from(&(-self.mass * lever));
+        matrix.fixed_view_mut::<3, 3>(3, 0).copy_from(&(self.mass * lever));
+        matrix
+            .fixed_view_mut::<3, 3>(3, 3)
+            .copy_from(&(self.rotational_inertia - self.mass * lever * lever));
+        matrix
+    }
+
+    /// Returns pinocchio's `Inertia::variation(motion)`: the 6×6 matrix `motion×* I − I motion×`,
+    /// the time derivative of this inertia when its frame moves with `motion`.
+    pub(crate) fn variation(&self, motion: &SpatialMotion) -> Matrix6<f64> {
+        let lever = self.center_of_mass;
+        let scaled_linear = motion.linear * self.mass;
+        let scaled_angular = motion.angular * self.mass;
+        let linear_angular = -scaled_linear.cross_matrix() - skew_square(&scaled_angular, &lever)
+            + skew_square(&lever, &scaled_angular);
+        let about_origin = self.rotational_inertia - self.mass * lever.cross_matrix() * lever.cross_matrix();
+        let angular_angular = -skew_square(&scaled_linear, &lever) - skew_square(&lever, &scaled_linear)
+            - about_origin * motion.angular.cross_matrix()
+            + motion.angular.cross_matrix() * about_origin;
+        let mut matrix = Matrix6::zeros();
+        matrix.fixed_view_mut::<3, 3>(0, 3).copy_from(&linear_angular);
+        matrix.fixed_view_mut::<3, 3>(3, 0).copy_from(&linear_angular.transpose());
+        matrix.fixed_view_mut::<3, 3>(3, 3).copy_from(&angular_angular);
+        matrix
+    }
+
     /// Returns the momentum (or inertial force) produced by this inertia moving with `motion`.
     pub(crate) fn apply(&self, motion: &SpatialMotion) -> SpatialForce {
         let linear =
@@ -88,7 +121,17 @@ impl RigidBodyInertia {
     }
 }
 
+/// Returns the matrix of `w ↦ u × (v × w)` (pinocchio's `skewSquare(u, v)`).
+fn skew_square(u: &Vector3<f64>, v: &Vector3<f64>) -> Matrix3<f64> {
+    v * u.transpose() - u.dot(v) * Matrix3::identity()
+}
+
 impl SpatialMotion {
+    /// Returns this motion as the vector `[linear; angular]`.
+    pub(crate) fn to_vector(self) -> Vector6<f64> {
+        Vector6::new(self.linear.x, self.linear.y, self.linear.z, self.angular.x, self.angular.y, self.angular.z)
+    }
+
     /// Returns the zero motion.
     pub fn zero() -> Self {
         Self {
@@ -153,6 +196,16 @@ impl std::ops::Add for SpatialMotion {
 }
 
 impl SpatialForce {
+    /// Returns the matrix pinocchio's `addForceCrossMatrix` adds for this force: `-[linear]×` in the
+    /// two off-diagonal blocks and `-[angular]×` in the angular block.
+    pub(crate) fn cross_matrix(&self) -> Matrix6<f64> {
+        let mut matrix = Matrix6::zeros();
+        matrix.fixed_view_mut::<3, 3>(0, 3).copy_from(&(-self.linear).cross_matrix());
+        matrix.fixed_view_mut::<3, 3>(3, 0).copy_from(&(-self.linear).cross_matrix());
+        matrix.fixed_view_mut::<3, 3>(3, 3).copy_from(&(-self.angular).cross_matrix());
+        matrix
+    }
+
     /// Re-expresses this force from a child frame into its parent frame.
     pub fn act(&self, parent_from_child: &Isometry3<f64>) -> Self {
         let linear = parent_from_child.rotation * self.linear;
@@ -245,5 +298,65 @@ mod tests {
                 + momentum.angular.dot(&motion_in_parent.angular)
         };
         assert!((energy_in_body - energy_in_parent).abs() < 1e-12);
+    }
+
+    /// Returns a body with an off-center mass and a full rotational inertia.
+    fn asymmetric_body() -> RigidBodyInertia {
+        RigidBodyInertia::new(
+            1.3,
+            Vector3::new(0.07, -0.03, 0.05),
+            Matrix3::new(0.02, 0.001, -0.002, 0.001, 0.03, 0.004, -0.002, 0.004, 0.015),
+        )
+    }
+
+    /// Returns a motion with every component nonzero.
+    fn test_motion() -> SpatialMotion {
+        SpatialMotion { linear: Vector3::new(0.4, -0.7, 0.2), angular: Vector3::new(-0.3, 0.9, 0.5) }
+    }
+
+    #[test]
+    fn spatial_matrix_maps_motion_to_momentum() {
+        let body = asymmetric_body();
+        let motion = test_motion();
+        let momentum = body.apply(&motion);
+        let expected = Vector6::new(
+            momentum.linear.x, momentum.linear.y, momentum.linear.z,
+            momentum.angular.x, momentum.angular.y, momentum.angular.z,
+        );
+        assert!((body.spatial_matrix() * motion.to_vector() - expected).norm() < 1e-12);
+    }
+
+    #[test]
+    fn skew_square_is_double_cross_product() {
+        let (u, v, w) = (Vector3::new(1.0, -2.0, 0.5), Vector3::new(0.3, 0.8, -1.1), Vector3::new(-0.6, 0.2, 0.9));
+        assert!((skew_square(&u, &v) * w - u.cross(&v.cross(&w))).norm() < 1e-12);
+    }
+
+    #[test]
+    fn variation_is_motion_cross_star_inertia_minus_inertia_motion_cross() {
+        // With [linear; angular] ordering: motion× = [[ω×, v×], [0, ω×]] and motion×* = −(motion×)ᵀ.
+        let body = asymmetric_body();
+        let motion = test_motion();
+        let mut motion_cross = Matrix6::zeros();
+        motion_cross.fixed_view_mut::<3, 3>(0, 0).copy_from(&motion.angular.cross_matrix());
+        motion_cross.fixed_view_mut::<3, 3>(0, 3).copy_from(&motion.linear.cross_matrix());
+        motion_cross.fixed_view_mut::<3, 3>(3, 3).copy_from(&motion.angular.cross_matrix());
+        let force_cross = -motion_cross.transpose();
+        let inertia = body.spatial_matrix();
+        let expected = force_cross * inertia - inertia * motion_cross;
+        assert!((body.variation(&motion) - expected).norm() < 1e-12);
+    }
+
+    #[test]
+    fn force_cross_matrix_maps_motion_to_negated_cross_product() {
+        // addForceCrossMatrix's matrix X satisfies X·m = m ×* f for force f (pinocchio's convention).
+        let force = SpatialForce { linear: Vector3::new(0.5, -1.0, 2.0), angular: Vector3::new(-0.2, 0.4, 0.1) };
+        let motion = test_motion();
+        let expected = motion.cross_force(&force);
+        let expected = Vector6::new(
+            expected.linear.x, expected.linear.y, expected.linear.z,
+            expected.angular.x, expected.angular.y, expected.angular.z,
+        );
+        assert!((force.cross_matrix() * motion.to_vector() - expected).norm() < 1e-12);
     }
 }

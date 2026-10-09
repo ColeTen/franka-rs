@@ -11,7 +11,7 @@
 // where <path-to-urdf> is the same file the franka-rs test loads (tests/fixtures/fr3_robot.urdf).
 //
 // Each line is: <tag> <input values...> <output values...>, full-precision decimals, in the order
-// the companion test (tests/model_test.rs) expects. Frames are encoded as an index 0..9 matching
+// the companion test (source/model/tests.rs, model_matches_libfranka) expects. Frames are encoded as an index 0..9 matching
 // franka::Frame (kJoint1..kJoint7, kFlange, kEndEffector, kStiffness). All 4x4 transforms and the
 // Jacobian/mass matrices are column-major, matching franka-rs's nalgebra column-major storage.
 
@@ -25,7 +25,19 @@
 #include <string>
 #include <vector>
 
+#include <random>
+
 #include <franka/model.h>
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
+#include <pinocchio/algorithm/rnea.hpp>
+#include <pinocchio/parsers/urdf.hpp>
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 using franka::Frame;
 using franka::Model;
@@ -84,6 +96,37 @@ static void emit_kinematics(const Model& model,
     auto body = model.bodyJacobian(frame, q, f_t_ee, ee_t_k);
     emit("body_jacobian", inputs, std::vector<double>(body.begin(), body.end()));
   }
+}
+
+// Emits pinocchio's Coriolis matrix C(q, dq) (computeCoriolisMatrix, the matrix libfranka's
+// deprecated coriolis overload multiplies by dq), with the payload attached to the last joint
+// exactly as libfranka's RobotModel::updateInertiaIfNeeded does. libfranka does not expose the
+// matrix, so pinocchio is called directly on the same URDF.
+static void emit_coriolis_matrix(const std::string& urdf,
+                                 const std::array<double, 7>& q,
+                                 const std::array<double, 7>& dq,
+                                 const std::array<double, 9>& inertia,
+                                 double mass,
+                                 const std::array<double, 3>& com) {
+  pinocchio::Model model;
+  pinocchio::urdf::buildModelFromXML(urdf, model);
+  const pinocchio::FrameIndex last_link = model.getFrameId("link8");
+  const pinocchio::JointIndex last_joint = model.frames[last_link].parentJoint;
+  const pinocchio::Inertia payload(mass, Eigen::Map<const Eigen::Vector3d>(com.data()),
+                                   Eigen::Map<const Eigen::Matrix3d>(inertia.data(), 3, 3));
+  model.inertias[last_joint] = model.inertias[last_joint] + model.frames[last_link].placement.act(payload);
+  pinocchio::Data data(model);
+  const Eigen::VectorXd q_eigen = Eigen::Map<const Eigen::VectorXd>(q.data(), 7);
+  const Eigen::VectorXd dq_eigen = Eigen::Map<const Eigen::VectorXd>(dq.data(), 7);
+  pinocchio::computeCoriolisMatrix(model, data, q_eigen, dq_eigen);
+  std::vector<double> inputs;
+  append(inputs, q);
+  append(inputs, dq);
+  append(inputs, inertia);
+  inputs.push_back(mass);
+  append(inputs, com);
+  const Eigen::MatrixXd& c = data.C;  // column-major
+  emit("coriolis_matrix", inputs, std::vector<double>(c.data(), c.data() + 49));
 }
 
 int main(int argc, char** argv) {
@@ -178,6 +221,33 @@ int main(int argc, char** argv) {
     append(inputs, gravity_earth);
     auto coriolis = model.coriolis(c.q, c.dq, c.load.inertia, c.load.mass, c.load.com, gravity_earth);
     emit("coriolis", inputs, std::vector<double>(coriolis.begin(), coriolis.end()));
+  }
+
+  // Coriolis matrices: the Coriolis cases above, then seeded random configurations, velocities and
+  // payloads (mass 0-2 kg, center of mass within 0.1 m, diagonal-dominant symmetric inertia).
+  for (const Coriolis& c : {Coriolis{q_zero, dq_unit, hand},
+                            Coriolis{q_ready, dq_mixed, no_load},
+                            Coriolis{q_moved, dq_mixed, hand},
+                            Coriolis{q_moved, dq_mixed, hand_offdiag}}) {
+    emit_coriolis_matrix(urdf, c.q, c.dq, c.load.inertia, c.load.mass, c.load.com);
+  }
+  // std::uniform_real_distribution is implementation-defined, so regenerating with another C++
+  // standard library can produce different random cases; the committed data file is the reference.
+  std::mt19937_64 rng(20261009);
+  std::uniform_real_distribution<double> unit(-1.0, 1.0);
+  for (int index = 0; index < 20; index++) {
+    std::array<double, 7> q{}, dq{};
+    for (size_t i = 0; i < 7; i++) {
+      q[i] = 2.0 * unit(rng);
+      dq[i] = 2.0 * unit(rng);
+    }
+    const double off_diagonal = 0.0005 * unit(rng);
+    const std::array<double, 9> inertia = {0.002 + 0.001 * unit(rng), off_diagonal, 0.0,
+                                           off_diagonal, 0.003 + 0.001 * unit(rng), 0.0,
+                                           0.0, 0.0, 0.002 + 0.001 * unit(rng)};
+    const double mass = 1.0 + unit(rng);
+    const std::array<double, 3> com = {0.1 * unit(rng), 0.1 * unit(rng), 0.1 * unit(rng)};
+    emit_coriolis_matrix(urdf, q, dq, inertia, mass, com);
   }
 
   return 0;

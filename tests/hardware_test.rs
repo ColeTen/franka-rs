@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = robot.read_once()?;
     let modeled_pose = model.pose_from_state(Frame::EndEffector, &state);
-    let reported_pose = CartesianPose::from_column_major(&state.o_t_ee).inner;
+    let reported_pose = CartesianPose::from_column_major(&state.o_t_ee).to_isometry()?;
     let position_error =
         (modeled_pose.translation.vector - reported_pose.translation.vector).norm();
     println!("modeled: {modeled_pose}\nreported: {reported_pose}\nposition error: {position_error} m");

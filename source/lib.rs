@@ -1,6 +1,7 @@
 pub mod active_control;
 mod command_checks;
 pub mod constants;
+mod eigen_compat;
 pub mod control_loop;
 pub mod control_types;
 pub mod errors;

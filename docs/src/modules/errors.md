@@ -4,7 +4,7 @@
 
 `franka-rs` uses a two-tier error system:
 
-1. **`FrankaError`** — application-level errors (network failures, protocol issues, control exceptions)
+1. **`FrankaError`** — application-level errors (network failures, protocol issues, control exceptions, invalid arguments)
 2. **`RobotErrors`** — bitfield of 41 hardware safety flags from the robot controller
 
 ```mermaid
@@ -16,9 +16,9 @@ classDiagram
         +IncompatibleVersion~server, library~
         +Control~message, log~
         +Command~message~
-        +Realtime~message~
         +Model~message~
         +InvalidOperation~message~
+        +InvalidArgument~message~
     }
 
     class RobotErrors {
@@ -36,7 +36,7 @@ classDiagram
         Result~T, FrankaError~
     }
 
-    FrankaError --> RobotErrors : Control variant contains log with RobotState
+    FrankaError ..> RobotErrors : Control messages include last_motion_errors
     FrankaResult --> FrankaError : Err variant
 ```
 
@@ -49,11 +49,11 @@ The main error type, implementing `std::error::Error` and `Display` via `thiserr
 | `Network` | TCP/UDP failure, timeout, unreachable host | `message`, optional `io::Error` source |
 | `Protocol` | Malformed packets, unexpected response format | `message` |
 | `IncompatibleVersion` | Server/client version mismatch during handshake | `server_version`, `library_version` |
-| `Control` | Robot reported errors during control loop | `message`, `Vec<RobotState>` log |
+| `Control` | The robot ended or rejected a running motion, or a misuse libfranka reports as a `ControlException` | `message`, `log: Vec<RobotState>` (currently always empty) |
 | `Command` | Robot rejected a configuration command | `message` |
-| `Realtime` | Non-finite values in control command | `message` |
-| `Model` | Invalid parameters for kinematics/dynamics | `message` |
+| `Model` | The robot's URDF cannot be used: invalid XML, not a serial chain of seven revolute joints ending in `link8`, missing joint velocity limits | `message` |
 | `InvalidOperation` | Attempted operation in wrong state | `message` |
+| `InvalidArgument` | Invalid command or filter/limiter input: non-finite value, cutoff frequency or sample time out of range, pose not a homogeneous transformation, elbow sign not ±1 (libfranka's `std::invalid_argument`) | `message` |
 
 ### Pattern Matching
 
@@ -76,12 +76,12 @@ match try_connect() {
     Err(FrankaError::IncompatibleVersion { server_version, library_version }) => {
         eprintln!("Version mismatch: server={server_version}, lib={library_version}");
     }
-    Err(FrankaError::Control { message, log }) => {
+    Err(FrankaError::Control { message, .. }) => {
+        // The message includes the robot's last_motion_errors when the robot ended the motion.
         eprintln!("Control error: {message}");
-        eprintln!("  Last {} states logged", log.len());
-        if let Some(last) = log.last() {
-            eprintln!("  Errors: {:?}", last.current_errors);
-        }
+    }
+    Err(FrankaError::InvalidArgument { message }) => {
+        eprintln!("Invalid command or input: {message}");
     }
     Err(e) => eprintln!("Other: {e}"),
 }
@@ -167,7 +167,7 @@ if state.last_motion_errors.contains(RobotErrors::CARTESIAN_REFLEX) {
 
 ### Wire Format Conversion
 
-The robot sends errors as a `[bool; 41]` array. Conversion is handled internally:
+The robot sends errors as a `[u8; 41]` array (one byte per flag), converted to `[bool; 41]` and then to `RobotErrors`:
 
 ```rust
 let bools = [false; 41];
@@ -183,7 +183,7 @@ Convenience alias used throughout the library:
 pub type FrankaResult<T> = Result<T, FrankaError>;
 ```
 
-All public methods return `FrankaResult<T>`, making `?` propagation ergonomic:
+Every fallible public method returns `FrankaResult<T>`, making `?` propagation ergonomic:
 
 ```rust
 fn do_work() -> FrankaResult<()> {
@@ -211,13 +211,4 @@ match robot.automatic_error_recovery() {
 }
 ```
 
-```mermaid
-stateDiagram-v2
-    [*] --> Normal
-    Normal --> Error: Safety violation
-    Error --> Recovery: automatic_error_recovery()
-    Recovery --> Normal: Success
-    Recovery --> Error: Still in fault
-    Error --> Manual: Cannot auto-recover
-    Manual --> Normal: Desk UI unlock
-```
+If recovery fails, `automatic_error_recovery` returns the robot's rejection as `FrankaError::Command`.

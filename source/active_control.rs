@@ -54,7 +54,7 @@ impl<'a> ActiveTorqueControl<'a> {
             return Err(finished_error());
         }
         let tau_j_d: [f64; 7] = **torques;
-        control_loop::check_finite_joints(&tau_j_d)?;
+        crate::command_checks::check_finite(&tau_j_d)?;
 
         let control_cmd = ControllerCommand {
             tau_j_d,
@@ -82,7 +82,7 @@ impl<'a> ActiveTorqueControl<'a> {
         if self.finished {
             return Err(finished_error());
         }
-        control_loop::check_finite_joints(torques)?;
+        crate::command_checks::check_finite(torques)?;
         let (motion_generator_mode, _) = self.network.latest_state_modes();
         if motion_generator_mode != MotionGeneratorMode::Idle as u8 && motion_generator_mode != MotionGeneratorMode::None as u8 {
             return Err(FrankaError::InvalidOperation {
@@ -188,7 +188,7 @@ impl<'a, M: MotionType> ActiveMotionControl<'a, M> {
         let motion = motion.active_command()?;
         let tau_j_d = match torques {
             Some(torques) => {
-                control_loop::check_finite_joints(torques)?;
+                crate::command_checks::check_finite(torques)?;
                 **torques
             }
             None => [0.0; 7],

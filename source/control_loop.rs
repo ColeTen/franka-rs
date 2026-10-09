@@ -6,6 +6,7 @@ use crate::control_types::{is_finished, motion_value, MotionResult, MotionType};
 use crate::errors::{FrankaError, FrankaResult};
 use crate::joint_velocity_limits::JointVelocityLimits;
 use crate::logging::Logger;
+use crate::command_checks::check_finite;
 use crate::lowpass_filter;
 use crate::motion_conversion::{self, FilterState};
 use crate::network::Network;
@@ -345,36 +346,17 @@ fn process_torque_command(
     state: &RobotState,
     config: &ControlLoopConfig,
 ) -> FrankaResult<ControllerCommand> {
-    let torques = motion_value(result);
-    let mut tau_j_d: [f64; 7] = *torques;
+    let mut tau_j_d: [f64; 7] = *motion_value(result);
 
-    // As libfranka's lowpassFilter and limitRate, non-finite inputs are rejected before filtering
-    // and limiting: the limiter would otherwise turn an infinite torque into a finite maximum step.
-    if motion_conversion::filters(config)? {
-        check_finite_joints(&tau_j_d)?;
-        if let Some(joint) = state.tau_j_d.iter().position(|value| !value.is_finite()) {
-            return Err(FrankaError::Realtime {
-                message: format!(
-                    "joint {joint} of the robot's last desired torque is not finite: {}",
-                    state.tau_j_d[joint]
-                ),
-            });
-        }
-        tau_j_d = lowpass_filter::lowpass_filter_joints(
-            DELTA_T,
-            &tau_j_d,
-            &state.tau_j_d,
-            config.cutoff_frequency,
-        );
+    // As libfranka's createControlCommand: the filter and the limiter reject non-finite inputs
+    // themselves (the limiter would otherwise turn an infinite torque into a finite maximum step).
+    if motion_conversion::filter_enabled(config) {
+        tau_j_d = lowpass_filter::lowpass_filter_joints(DELTA_T, &tau_j_d, &state.tau_j_d, config.cutoff_frequency)?;
     }
-
     if config.limit_rate {
-        check_finite_joints(&tau_j_d)?;
-        tau_j_d =
-            rate_limiting::limit_rate_torques(&rate_limiting::MAX_TORQUE_RATE, &tau_j_d, &state.tau_j_d);
+        tau_j_d = rate_limiting::limit_rate_torques(&rate_limiting::MAX_TORQUE_RATE, &tau_j_d, &state.tau_j_d)?;
     }
-
-    check_finite_joints(&tau_j_d)?;
+    check_finite(&tau_j_d)?;
 
     Ok(ControllerCommand {
         tau_j_d,
@@ -650,30 +632,6 @@ fn build_robot_command(
     }
 }
 
-// --- Validation helpers ---
-
-pub(crate) fn check_finite_joints(values: &[f64; 7]) -> FrankaResult<()> {
-    for (i, &v) in values.iter().enumerate() {
-        if !v.is_finite() {
-            return Err(FrankaError::Realtime {
-                message: format!("joint {i} command is not finite: {v}"),
-            });
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn check_finite_array<const N: usize>(values: &[f64; N]) -> FrankaResult<()> {
-    for (i, &v) in values.iter().enumerate() {
-        if !v.is_finite() {
-            return Err(FrankaError::Realtime {
-                message: format!("command element {i} is not finite: {v}"),
-            });
-        }
-    }
-    Ok(())
-}
-
 fn struct_to_bytes<T: Copy>(value: &T) -> Vec<u8> {
     let size = std::mem::size_of::<T>();
     let mut bytes = vec![0u8; size];
@@ -785,7 +743,7 @@ mod tests {
                     &torque_config(limit_rate, filter),
                 );
                 assert!(
-                    matches!(result, Err(FrankaError::Realtime { .. })),
+                    matches!(result, Err(FrankaError::InvalidArgument { .. })),
                     "torque {bad_value}, limit_rate {limit_rate}, filter {filter}: {result:?}"
                 );
             }
@@ -802,7 +760,7 @@ mod tests {
                 &config,
             );
             assert!(
-                matches!(result, Err(FrankaError::InvalidOperation { .. })),
+                matches!(result, Err(FrankaError::InvalidArgument { .. })),
                 "cutoff {cutoff_frequency}: {result:?}"
             );
         }
@@ -818,7 +776,7 @@ mod tests {
             &torque_config(false, true),
         );
         assert!(
-            matches!(&result, Err(FrankaError::Realtime { message }) if message.contains("last desired torque")),
+            matches!(&result, Err(FrankaError::InvalidArgument { message }) if message.contains("past input value")),
             "{result:?}"
         );
     }

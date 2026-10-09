@@ -17,8 +17,8 @@ classDiagram
         -u32 motion_id
         -bool finished
         +read_state() FrankaResult~RobotState~
-        +write_torques(torques) FrankaResult~RobotState~
-        +finish(torques) FrankaResult~()~
+        +write_torques(&Torques) FrankaResult~RobotState~
+        +finish(&Torques) FrankaResult~()~
     }
 
     class ActiveMotionControl~'a, M: MotionType~ {
@@ -28,10 +28,10 @@ classDiagram
         -bool finished
         -PhantomData~M~
         +read_state() FrankaResult~RobotState~
-        +write_motion(motion: M) FrankaResult~RobotState~
-        +write_motion_with_torques(motion: M, torques) FrankaResult~RobotState~
-        +finish(motion: M) FrankaResult~()~
-        +finish_with_torques(motion: M, torques) FrankaResult~()~
+        +write_motion(&M) FrankaResult~RobotState~
+        +write_motion_with_torques(&M, &Torques) FrankaResult~RobotState~
+        +finish(&M) FrankaResult~()~
+        +finish_with_torques(&M, &Torques) FrankaResult~()~
     }
 
     ActiveTorqueControl --> Network : borrows &mut
@@ -47,13 +47,13 @@ classDiagram
 flowchart LR
     subgraph "Callback Style"
         direction TB
-        CB_ROBOT["robot.control_torques(|state, dt| {<br/>    // your code here<br/>    ControlFlow::Continue(torques)<br/>})"]
+        CB_ROBOT["robot.control_torques(&config, |state, period| {<br/>    // your code here<br/>    ControlFlow::Continue(torques)<br/>})"]
     end
 
     subgraph "Active Control Style"
         direction TB
         AC_START["let mut ctrl = robot.start_torque_control()?"]
-        AC_LOOP["loop {<br/>    let state = ctrl.read_state()?;<br/>    let tau = compute(state);<br/>    ctrl.write_torques(&tau)?;<br/>}"]
+        AC_LOOP["let mut state = ctrl.read_state()?;<br/>loop {<br/>    let tau = compute(&state);<br/>    state = ctrl.write_torques(&tau)?;<br/>}"]
         AC_FINISH["ctrl.finish(&tau)? // or drop to cancel"]
         AC_START --> AC_LOOP --> AC_FINISH
     end
@@ -72,8 +72,8 @@ let mut ctrl = robot.start_torque_control()?;
 ### Read / Write Loop
 
 ```rust
+let mut state = ctrl.read_state()?;
 loop {
-    let state = ctrl.read_state()?;
     let tau = compute_torques(&state);
 
     if should_stop(&state) {
@@ -83,10 +83,16 @@ loop {
         break;
     }
 
-    // write_torques sends the command and returns the next state
-    let next_state = ctrl.write_torques(&Torques::new(tau))?;
+    // write_torques sends the command answering `state` and returns the next state; calling
+    // read_state() as well would skip a state each cycle
+    state = ctrl.write_torques(&Torques::new(tau))?;
 }
 ```
+
+`read_state` (and `write_torques`, which reads the next state) returns an error once the robot has
+left the motion (user stop, reflex), as libfranka's `readOnce` does; `finish` returns an error if
+the robot answers the finish with an abort status. All return `InvalidOperation` after the session
+has finished. Torques are sent unfiltered and unlimited, after the finite check.
 
 ### RAII Cleanup
 

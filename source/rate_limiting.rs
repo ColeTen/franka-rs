@@ -1,8 +1,9 @@
 #![allow(clippy::too_many_arguments)]
 
-use nalgebra::Vector3;
-
+use crate::command_checks;
 use crate::constants::DELTA_T;
+use crate::eigen_compat;
+use crate::errors::{FrankaError, FrankaResult};
 
 /// Epsilon value for checking limits.
 pub const LIMIT_EPS: f64 = 1e-3;
@@ -87,24 +88,37 @@ fn cpp_max(a: f64, b: f64) -> f64 {
     if a < b { b } else { a }
 }
 
+/// Returns an [`FrankaError::InvalidArgument`] naming `what` unless every value is finite.
+fn require_finite(values: &[f64], what: &str) -> FrankaResult<()> {
+    if values.iter().all(|value| value.is_finite()) {
+        Ok(())
+    } else {
+        Err(FrankaError::InvalidArgument { message: format!("{what} is infinite or NaN") })
+    }
+}
+
 /// Limit the rate of per-joint torque commands.
 ///
 /// Clamps the derivative of each joint value to `max_derivatives[i]`.
+///
+/// # Errors
+/// [`FrankaError::InvalidArgument`] if a commanded value is not finite.
 pub fn limit_rate_torques(
     max_derivatives: &[f64; 7],
     commanded: &[f64; 7],
     last_commanded: &[f64; 7],
-) -> [f64; 7] {
-    let mut limited = [0.0; 7];
-    for i in 0..7 {
+) -> FrankaResult<[f64; 7]> {
+    require_finite(commanded, "commanded value")?;
+    Ok(std::array::from_fn(|i| {
         let derivative = (commanded[i] - last_commanded[i]) / DELTA_T;
-        limited[i] = last_commanded[i]
-            + cpp_max(cpp_min(derivative, max_derivatives[i]), -max_derivatives[i]) * DELTA_T;
-    }
-    limited
+        last_commanded[i] + cpp_max(cpp_min(derivative, max_derivatives[i]), -max_derivatives[i]) * DELTA_T
+    }))
 }
 
 /// Limit the rate of a single joint velocity value.
+///
+/// # Errors
+/// [`FrankaError::InvalidArgument`] if `commanded_velocity` is not finite.
 pub fn limit_rate_velocity(
     upper_limit: f64,
     lower_limit: f64,
@@ -113,7 +127,8 @@ pub fn limit_rate_velocity(
     commanded_velocity: f64,
     last_commanded_velocity: f64,
     last_commanded_acceleration: f64,
-) -> f64 {
+) -> FrankaResult<f64> {
+    require_finite(&[commanded_velocity], "commanded velocity")?;
     // Differentiate to get jerk
     let commanded_jerk =
         (((commanded_velocity - last_commanded_velocity) / DELTA_T) - last_commanded_acceleration)
@@ -131,12 +146,16 @@ pub fn limit_rate_velocity(
 
     // Limit acceleration and integrate to get velocity. The bounds can cross when the last velocity
     // already exceeds a velocity limit; applying the upper bound first and the lower bound last
-    // then yields the lower bound (and `f64::clamp` would panic).
-    last_commanded_velocity
-        + cpp_max(cpp_min(commanded_acceleration, safe_max_acceleration), safe_min_acceleration) * DELTA_T
+    // then yields the lower bound.
+    Ok(last_commanded_velocity
+        + cpp_max(cpp_min(commanded_acceleration, safe_max_acceleration), safe_min_acceleration) * DELTA_T)
 }
 
 /// Limit the rate of a single joint position value.
+///
+/// # Errors
+/// [`FrankaError::InvalidArgument`] if `commanded_position` (or the velocity derived from it) is
+/// not finite.
 pub fn limit_rate_position(
     upper_velocity_limit: f64,
     lower_velocity_limit: f64,
@@ -146,22 +165,25 @@ pub fn limit_rate_position(
     last_commanded_position: f64,
     last_commanded_velocity: f64,
     last_commanded_acceleration: f64,
-) -> f64 {
+) -> FrankaResult<f64> {
+    require_finite(&[commanded_position], "commanded position")?;
     // Convert position command to velocity command, then limit the velocity
-    let commanded_velocity = (commanded_position - last_commanded_position) / DELTA_T;
     let limited_velocity = limit_rate_velocity(
         upper_velocity_limit,
         lower_velocity_limit,
         max_acceleration,
         max_jerk,
-        commanded_velocity,
+        (commanded_position - last_commanded_position) / DELTA_T,
         last_commanded_velocity,
         last_commanded_acceleration,
-    );
-    last_commanded_position + limited_velocity * DELTA_T
+    )?;
+    Ok(last_commanded_position + limited_velocity * DELTA_T)
 }
 
 /// Limit the rate of joint velocities (all 7 joints).
+///
+/// # Errors
+/// [`FrankaError::InvalidArgument`] if a commanded velocity is not finite.
 pub fn limit_rate_joint_velocities(
     upper_limits: &[f64; 7],
     lower_limits: &[f64; 7],
@@ -170,7 +192,8 @@ pub fn limit_rate_joint_velocities(
     commanded: &[f64; 7],
     last_commanded: &[f64; 7],
     last_acceleration: &[f64; 7],
-) -> [f64; 7] {
+) -> FrankaResult<[f64; 7]> {
+    require_finite(commanded, "commanded velocities")?;
     let mut limited = [0.0; 7];
     for i in 0..7 {
         limited[i] = limit_rate_velocity(
@@ -181,12 +204,15 @@ pub fn limit_rate_joint_velocities(
             commanded[i],
             last_commanded[i],
             last_acceleration[i],
-        );
+        )?;
     }
-    limited
+    Ok(limited)
 }
 
 /// Limit the rate of joint positions (all 7 joints).
+///
+/// # Errors
+/// [`FrankaError::InvalidArgument`] if a commanded position is not finite.
 pub fn limit_rate_joint_positions(
     upper_velocity_limits: &[f64; 7],
     lower_velocity_limits: &[f64; 7],
@@ -196,7 +222,8 @@ pub fn limit_rate_joint_positions(
     last_commanded: &[f64; 7],
     last_velocity: &[f64; 7],
     last_acceleration: &[f64; 7],
-) -> [f64; 7] {
+) -> FrankaResult<[f64; 7]> {
+    require_finite(commanded, "commanded positions")?;
     let mut limited = [0.0; 7];
     for i in 0..7 {
         limited[i] = limit_rate_position(
@@ -208,55 +235,64 @@ pub fn limit_rate_joint_positions(
             last_commanded[i],
             last_velocity[i],
             last_acceleration[i],
-        );
+        )?;
     }
-    limited
+    Ok(limited)
 }
 
-/// Limit the rate of a 3D vector (translational or rotational velocity).
+/// Limit the rate of a 3D vector (translational or rotational velocity), with libfranka's
+/// arithmetic (Eigen's summation order; a NaN distance to the maximum velocity leaves the
+/// acceleration unlimited by it, as in libfranka).
 fn limit_rate_vector3(
     max_velocity: f64,
     max_acceleration: f64,
     max_jerk: f64,
-    commanded: &Vector3<f64>,
-    last_commanded: &Vector3<f64>,
-    last_acceleration: &Vector3<f64>,
-) -> Vector3<f64> {
+    commanded: &[f64; 3],
+    last_commanded: &[f64; 3],
+    last_acceleration: &[f64; 3],
+) -> [f64; 3] {
     // Differentiate to get jerk
-    let commanded_jerk =
-        ((commanded - last_commanded) / DELTA_T - last_acceleration) / DELTA_T;
+    let commanded_jerk: [f64; 3] =
+        std::array::from_fn(|i| (((commanded[i] - last_commanded[i]) / DELTA_T) - last_acceleration[i]) / DELTA_T);
 
     // Limit jerk and integrate to get desired acceleration
     let mut commanded_acceleration = *last_acceleration;
-    let jerk_norm = commanded_jerk.norm();
+    let jerk_norm = eigen_compat::norm3(&commanded_jerk);
     if jerk_norm > NORM_EPS {
-        commanded_acceleration +=
-            (commanded_jerk / jerk_norm) * cpp_max(cpp_min(jerk_norm, max_jerk), -max_jerk) * DELTA_T;
+        let limited_jerk = cpp_max(cpp_min(jerk_norm, max_jerk), -max_jerk);
+        for i in 0..3 {
+            commanded_acceleration[i] += ((commanded_jerk[i] / jerk_norm) * limited_jerk) * DELTA_T;
+        }
     }
 
     // Distance to the maximum velocity along the acceleration direction, as libfranka computes it:
     // with no acceleration the direction is NaN, and when the last velocity already exceeds the
-    // maximum the square root is NaN; either way cpp_min then leaves the acceleration unlimited
-    // by this bound.
-    let accel_norm = commanded_acceleration.norm();
-    let unit_accel = commanded_acceleration / accel_norm;
-    let dot_product = unit_accel.dot(last_commanded);
+    // maximum the square root is NaN; either way cpp_min then leaves the acceleration unlimited by
+    // this bound.
+    let acceleration_norm = eigen_compat::norm3(&commanded_acceleration);
+    let unit_acceleration = commanded_acceleration.map(|value| value / acceleration_norm);
+    let dot_product = eigen_compat::dot3(&unit_acceleration, last_commanded);
     let distance_to_max = -dot_product
-        + (dot_product.powi(2) - last_commanded.norm_squared() + max_velocity.powi(2)).sqrt();
+        + (dot_product * dot_product - eigen_compat::squared_norm3(last_commanded) + max_velocity * max_velocity).sqrt();
 
     // Compute safe acceleration limit
     let safe_max_acceleration = cpp_min((max_jerk / max_acceleration) * distance_to_max, max_acceleration);
 
     // Limit acceleration and integrate to get velocity
     let mut limited = *last_commanded;
-    if accel_norm > NORM_EPS {
-        limited += unit_accel * cpp_min(accel_norm, safe_max_acceleration) * DELTA_T;
+    if acceleration_norm > NORM_EPS {
+        let step = cpp_min(acceleration_norm, safe_max_acceleration);
+        for i in 0..3 {
+            limited[i] += (unit_acceleration[i] * step) * DELTA_T;
+        }
     }
-
     limited
 }
 
 /// Limit the rate of a Cartesian velocity (6D twist: [vx, vy, vz, wx, wy, wz]).
+///
+/// # Errors
+/// [`FrankaError::InvalidArgument`] if a commanded value is not finite.
 pub fn limit_rate_cartesian_velocity(
     max_translational_velocity: f64,
     max_translational_acceleration: f64,
@@ -267,45 +303,36 @@ pub fn limit_rate_cartesian_velocity(
     commanded: &[f64; 6],
     last_commanded: &[f64; 6],
     last_acceleration: &[f64; 6],
-) -> [f64; 6] {
-    let cmd_trans = Vector3::new(commanded[0], commanded[1], commanded[2]);
-    let cmd_rot = Vector3::new(commanded[3], commanded[4], commanded[5]);
-    let last_trans = Vector3::new(last_commanded[0], last_commanded[1], last_commanded[2]);
-    let last_rot = Vector3::new(last_commanded[3], last_commanded[4], last_commanded[5]);
-    let last_accel_trans =
-        Vector3::new(last_acceleration[0], last_acceleration[1], last_acceleration[2]);
-    let last_accel_rot =
-        Vector3::new(last_acceleration[3], last_acceleration[4], last_acceleration[5]);
-
-    let limited_trans = limit_rate_vector3(
+) -> FrankaResult<[f64; 6]> {
+    require_finite(commanded, "O_dP_EE_c")?;
+    let head = |values: &[f64; 6]| [values[0], values[1], values[2]];
+    let tail = |values: &[f64; 6]| [values[3], values[4], values[5]];
+    let translation = limit_rate_vector3(
         max_translational_velocity,
         max_translational_acceleration,
         max_translational_jerk,
-        &cmd_trans,
-        &last_trans,
-        &last_accel_trans,
+        &head(commanded),
+        &head(last_commanded),
+        &head(last_acceleration),
     );
-
-    let limited_rot = limit_rate_vector3(
+    let rotation = limit_rate_vector3(
         max_rotational_velocity,
         max_rotational_acceleration,
         max_rotational_jerk,
-        &cmd_rot,
-        &last_rot,
-        &last_accel_rot,
+        &tail(commanded),
+        &tail(last_commanded),
+        &tail(last_acceleration),
     );
-
-    [
-        limited_trans.x,
-        limited_trans.y,
-        limited_trans.z,
-        limited_rot.x,
-        limited_rot.y,
-        limited_rot.z,
-    ]
+    Ok([translation[0], translation[1], translation[2], rotation[0], rotation[1], rotation[2]])
 }
 
-/// Limit the rate of a Cartesian pose (4x4 column-major homogeneous transform).
+/// Limit the rate of a Cartesian pose (4x4 column-major homogeneous transform), with libfranka's
+/// arithmetic (rotations extracted as Eigen's `Affine3d::rotation()`, the rotation difference as
+/// Eigen's `AngleAxisd`).
+///
+/// # Errors
+/// [`FrankaError::InvalidArgument`] if `commanded` is not finite or not a homogeneous
+/// transformation.
 pub fn limit_rate_cartesian_pose(
     max_translational_velocity: f64,
     max_translational_acceleration: f64,
@@ -317,35 +344,21 @@ pub fn limit_rate_cartesian_pose(
     last_commanded: &[f64; 16],
     last_twist: &[f64; 6],
     last_acceleration: &[f64; 6],
-) -> [f64; 16] {
-    use nalgebra::{Matrix3, Matrix4, Rotation3};
+) -> FrankaResult<[f64; 16]> {
+    require_finite(commanded, "O_T_EE_c")?;
+    command_checks::check_matrix(commanded)?;
+    let last_rotation = eigen_compat::affine_rotation(&eigen_compat::linear_part(last_commanded));
 
-    let cmd_mat = Matrix4::from_column_slice(commanded);
-    let last_mat = Matrix4::from_column_slice(last_commanded);
-
-    let cmd_translation = Vector3::new(cmd_mat[(0, 3)], cmd_mat[(1, 3)], cmd_mat[(2, 3)]);
-    let last_translation = Vector3::new(last_mat[(0, 3)], last_mat[(1, 3)], last_mat[(2, 3)]);
-
-    // Compute translational velocity from pose difference
-    let trans_vel = (cmd_translation - last_translation) / DELTA_T;
-
-    // Compute rotational velocity from rotation difference
-    let cmd_rot: Matrix3<f64> = cmd_mat.fixed_view::<3, 3>(0, 0).into_owned();
-    let last_rot: Matrix3<f64> = last_mat.fixed_view::<3, 3>(0, 0).into_owned();
-
-    let rot_diff = Rotation3::from_matrix_unchecked(cmd_rot * last_rot.transpose());
-    let angle_axis = rot_diff.scaled_axis();
-    let rot_vel = angle_axis / DELTA_T;
-
-    // Build the twist and limit it
-    let twist = [
-        trans_vel.x,
-        trans_vel.y,
-        trans_vel.z,
-        rot_vel.x,
-        rot_vel.y,
-        rot_vel.z,
-    ];
+    // Twist from the pose difference: translational velocity, then rotational velocity.
+    let mut twist = [0.0; 6];
+    for i in 0..3 {
+        twist[i] = (commanded[12 + i] - last_commanded[12 + i]) / DELTA_T;
+    }
+    let commanded_rotation = eigen_compat::affine_rotation(&eigen_compat::linear_part(commanded));
+    let (angle, axis) = eigen_compat::angle_axis(&eigen_compat::mul_transpose(&commanded_rotation, &last_rotation));
+    for i in 0..3 {
+        twist[3 + i] = (axis[i] * angle) / DELTA_T;
+    }
 
     let limited_twist = limit_rate_cartesian_velocity(
         max_translational_velocity,
@@ -357,38 +370,36 @@ pub fn limit_rate_cartesian_pose(
         &twist,
         last_twist,
         last_acceleration,
-    );
+    )?;
 
-    // Integrate limited twist to get limited pose
-    let limited_translation = last_translation
-        + Vector3::new(limited_twist[0], limited_twist[1], limited_twist[2]) * DELTA_T;
-
-    let omega = Vector3::new(limited_twist[3], limited_twist[4], limited_twist[5]);
-    let omega_norm = omega.norm();
-
-    let limited_rot = if omega_norm > NORM_EPS {
-        let w_norm = omega / omega_norm;
-        let theta = DELTA_T * omega_norm;
-        // Rodrigues' rotation formula
-        let omega_skew = Matrix3::new(
-            0.0, -w_norm.z, w_norm.y, w_norm.z, 0.0, -w_norm.x, -w_norm.y, w_norm.x, 0.0,
-        );
-        let rotation =
-            Matrix3::identity() + theta.sin() * omega_skew + (1.0 - theta.cos()) * (omega_skew * omega_skew);
-        rotation * last_rot
-    } else {
-        last_rot
-    };
-
-    let mut result_mat = Matrix4::identity();
-    result_mat.fixed_view_mut::<3, 3>(0, 0).copy_from(&limited_rot);
-    result_mat[(0, 3)] = limited_translation.x;
-    result_mat[(1, 3)] = limited_translation.y;
-    result_mat[(2, 3)] = limited_translation.z;
-
+    // Integrate the limited twist: translation, then rotation (Rodrigues' formula).
     let mut result = [0.0; 16];
-    result.copy_from_slice(result_mat.as_slice());
-    result
+    result[15] = 1.0;
+    for i in 0..3 {
+        result[12 + i] = last_commanded[12 + i] + limited_twist[i] * DELTA_T;
+    }
+    let omega = [limited_twist[3], limited_twist[4], limited_twist[5]];
+    let omega_norm = eigen_compat::norm3(&omega);
+    let rotation = if omega_norm > NORM_EPS {
+        let w = omega.map(|value| value / omega_norm);
+        let theta = DELTA_T * omega_norm;
+        let skew = [[0.0, -w[2], w[1]], [w[2], 0.0, -w[0]], [-w[1], w[0], 0.0]];
+        let (sin_theta, one_minus_cos) = (theta.sin(), 1.0 - theta.cos());
+        let skew_squared = eigen_compat::scaled_mul(one_minus_cos, &skew, &skew);
+        let identity = eigen_compat::identity();
+        let step: eigen_compat::Mat3 = std::array::from_fn(|i| {
+            std::array::from_fn(|j| (identity[i][j] + sin_theta * skew[i][j]) + skew_squared[i][j])
+        });
+        eigen_compat::mul(&step, &last_rotation)
+    } else {
+        last_rotation
+    };
+    for column in 0..3 {
+        for row in 0..3 {
+            result[column * 4 + row] = rotation[row][column];
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -398,7 +409,7 @@ mod tests {
     #[test]
     fn limit_rate_torques_no_change() {
         let values = [1.0; 7];
-        let result = limit_rate_torques(&MAX_TORQUE_RATE, &values, &values);
+        let result = limit_rate_torques(&MAX_TORQUE_RATE, &values, &values).unwrap();
         for i in 0..7 {
             assert!((result[i] - values[i]).abs() < 1e-12);
         }
@@ -408,7 +419,7 @@ mod tests {
     fn limit_rate_velocity_decelerates_when_last_velocity_exceeds_upper_limit() {
         // Last velocity 0.1 is above the upper limit 0.0, so the acceleration bounds cross
         // (safe max -50, safe min -10); the result decelerates at the lower bound.
-        let result = limit_rate_velocity(0.0, -1.0, 10.0, 5000.0, 0.1, 0.1, 0.0);
+        let result = limit_rate_velocity(0.0, -1.0, 10.0, 5000.0, 0.1, 0.1, 0.0).unwrap();
         assert!((result - (0.1 - 10.0 * DELTA_T)).abs() < 1e-12);
     }
 
@@ -417,7 +428,7 @@ mod tests {
         let last = [0.0; 7];
         // A change of 10 in 1ms = 10000 Nm/s, which exceeds max of ~999 Nm/s
         let commanded = [10.0; 7];
-        let result = limit_rate_torques(&MAX_TORQUE_RATE, &commanded, &last);
+        let result = limit_rate_torques(&MAX_TORQUE_RATE, &commanded, &last).unwrap();
         for i in 0..7 {
             // Should be clamped to max_rate * dt = ~0.999
             assert!(result[i] < 1.0);
@@ -430,7 +441,7 @@ mod tests {
         let last = [0.0; 7];
         // A small change well within limits
         let commanded = [0.0001; 7];
-        let result = limit_rate_torques(&MAX_TORQUE_RATE, &commanded, &last);
+        let result = limit_rate_torques(&MAX_TORQUE_RATE, &commanded, &last).unwrap();
         for i in 0..7 {
             assert!((result[i] - commanded[i]).abs() < 1e-12);
         }
@@ -438,13 +449,13 @@ mod tests {
 
     #[test]
     fn limit_rate_velocity_no_change() {
-        let result = limit_rate_velocity(2.62, -2.62, 10.0, 5000.0, 0.5, 0.5, 0.0);
+        let result = limit_rate_velocity(2.62, -2.62, 10.0, 5000.0, 0.5, 0.5, 0.0).unwrap();
         assert!((result - 0.5).abs() < 1e-10);
     }
 
     #[test]
     fn limit_rate_position_no_change() {
-        let result = limit_rate_position(2.62, -2.62, 10.0, 5000.0, 1.0, 1.0, 0.0, 0.0);
+        let result = limit_rate_position(2.62, -2.62, 10.0, 5000.0, 1.0, 1.0, 0.0, 0.0).unwrap();
         assert!((result - 1.0).abs() < 1e-10);
     }
 
@@ -465,7 +476,7 @@ mod tests {
             &commanded,
             &last,
             &acceleration,
-        );
+        ).unwrap();
         assert!((result[0] - DELTA_T).abs() < 1e-12, "{result:?}");
         assert!((result[1] - 3.5).abs() < 1e-12, "{result:?}");
     }
@@ -483,9 +494,46 @@ mod tests {
             &zero,
             &zero,
             &zero,
-        );
+        ).unwrap();
         for v in &result {
             assert!(v.abs() < 1e-10);
         }
+    }
+
+    #[test]
+    fn every_public_limiter_rejects_non_finite_commands() {
+        let zero7 = [0.0; 7];
+        let mut bad7 = zero7;
+        bad7[4] = f64::INFINITY;
+        let zero6 = [0.0; 6];
+        let mut bad6 = zero6;
+        bad6[2] = f64::NAN;
+        let mut identity = [0.0; 16];
+        for index in [0, 5, 10, 15] {
+            identity[index] = 1.0;
+        }
+        let mut bad_pose = identity;
+        bad_pose[13] = f64::NAN;
+        let invalid = |result: FrankaResult<()>| matches!(result, Err(FrankaError::InvalidArgument { .. }));
+        assert!(invalid(limit_rate_torques(&MAX_TORQUE_RATE, &bad7, &zero7).map(|_| ())));
+        assert!(invalid(limit_rate_velocity(1.0, -1.0, 10.0, 5000.0, f64::NAN, 0.0, 0.0).map(|_| ())));
+        assert!(invalid(limit_rate_position(1.0, -1.0, 10.0, 5000.0, f64::INFINITY, 0.0, 0.0, 0.0).map(|_| ())));
+        assert!(invalid(
+            limit_rate_joint_velocities(&[1.0; 7], &[-1.0; 7], &MAX_JOINT_ACCELERATION, &MAX_JOINT_JERK, &bad7, &zero7, &zero7)
+                .map(|_| ())
+        ));
+        assert!(invalid(
+            limit_rate_joint_positions(&[1.0; 7], &[-1.0; 7], &MAX_JOINT_ACCELERATION, &MAX_JOINT_JERK, &bad7, &zero7, &zero7, &zero7)
+                .map(|_| ())
+        ));
+        assert!(invalid(limit_rate_cartesian_velocity(3.0, 9.0, 4500.0, 2.5, 17.0, 8500.0, &bad6, &zero6, &zero6).map(|_| ())));
+        assert!(invalid(
+            limit_rate_cartesian_pose(3.0, 9.0, 4500.0, 2.5, 17.0, 8500.0, &bad_pose, &identity, &zero6, &zero6).map(|_| ())
+        ));
+        let mut scaled = identity;
+        scaled[0] = 2.0;
+        assert!(invalid(
+            limit_rate_cartesian_pose(3.0, 9.0, 4500.0, 2.5, 17.0, 8500.0, &scaled, &identity, &zero6, &zero6).map(|_| ())
+        ));
     }
 }

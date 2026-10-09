@@ -311,6 +311,73 @@ fn coriolis_equals_inverse_dynamics_minus_gravity() {
     assert!((model.coriolis(&q, &dq, &payload) - two_pass).norm() < 1e-12);
 }
 
+/// Configurations, velocities and payloads for the Coriolis matrix property tests.
+fn coriolis_cases() -> Vec<(JointVector, JointVector, RigidBodyInertia)> {
+    vec![
+        (JointVector::zeros(), JointVector::repeat(1.0), franka_hand()),
+        (moved_configuration(), JointVector::from([0.3, -0.2, 0.5, 0.1, -0.4, 0.2, 0.6]), RigidBodyInertia::zero()),
+        (
+            JointVector::from([0.5, -0.8, 0.3, -2.0, 0.7, 1.9, -0.4]),
+            JointVector::from([-1.2, 0.8, 1.5, -0.6, 2.0, -1.7, 0.9]),
+            franka_hand(),
+        ),
+    ]
+}
+
+#[test]
+fn coriolis_matrix_times_velocity_equals_coriolis_vector() {
+    let model = fr3_model();
+    for (q, dq, payload) in coriolis_cases() {
+        let product = model.coriolis_matrix(&q, &dq, &payload) * dq;
+        let vector = model.coriolis(&q, &dq, &payload);
+        assert!((product - vector).norm() < 1e-10, "C·dq {product} vs coriolis {vector}");
+    }
+}
+
+#[test]
+fn coriolis_matrix_matches_pinocchio_regression_case() {
+    // pinocchio's computeCoriolisMatrix on tests/fixtures/fr3_robot.urdf with this payload, from
+    // validation/data/model_cases.txt (column-major); kept here so the check does not depend on
+    // that file being present.
+    const EXPECTED: [f64; 49] = [
+        -0.0056320207828805006, -0.28282826614113721, -0.0053226892025679011, -0.44559253498988888, -0.012319345441680372, -0.068605639765445189, 0.0018965681388772892,
+        0.1051617110605816, 0.076884750121323606, 0.10393676356326706, 0.15725028648397482, 0.0053745116246591918, 0.020091045736487994, -0.00098372651663917836,
+        0.063709518385619904, -0.28033129263212458, 0.063712517014098621, -0.44655457703350432, -0.017231102677356936, -0.068965055371151135, 0.0018704555728834727,
+        0.44424502304303015, -0.23603086084757174, 0.4441974723309966, -0.001078882258652364, -0.0026550016797254657, -0.0013289874475435788, -0.0015952372962516359,
+        -0.001870481526443174, 0.0018026319367164174, -0.0018832270044911532, 0.0082159007484936594, 0.00094015688244355013, -0.00055218568238799004, -3.5214465464948423e-05,
+        0.13249956282082384, -0.04449532311864051, 0.13250455780469056, 0.00043297156252905403, -0.00081510590064363996, -0.00031635848612088561, -0.0014497122309985817,
+        -0.0013135700475835482, -0.00046116606138865652, -0.0013131332400745305, 0.0019958662033371481, 0.00028088197436838542, 0.00090444094560480763, -1.9873087008480395e-17,
+    ];
+    let model = fr3_model();
+    let q = JointVector::from([0.001, 0.001, 0.001, -2.3552, 0.001, 2.3572000000000002, 0.001]);
+    let dq = JointVector::from([0.3, -0.2, 0.5, 0.1, -0.4, 0.2, 0.6]);
+    let payload = RigidBodyInertia::new(
+        0.73,
+        Vector3::new(0.01, 0.0, 0.03),
+        Matrix3::from_diagonal(&Vector3::new(0.001, 0.0025, 0.0017)),
+    );
+    assert_close(model.coriolis_matrix(&q, &dq, &payload).as_slice(), &EXPECTED, 1e-12);
+}
+
+#[test]
+fn coriolis_matrix_is_zero_at_rest() {
+    let model = fr3_model();
+    let matrix = model.coriolis_matrix(&moved_configuration(), &JointVector::zeros(), &franka_hand());
+    assert_eq!(matrix.norm(), 0.0);
+}
+
+#[test]
+fn mass_derivative_minus_twice_coriolis_matrix_is_skew_symmetric() {
+    // Ṁ along dq by a central difference; Ṁ − 2C must be skew-symmetric for this C.
+    let model = fr3_model();
+    let step = 1e-6;
+    for (q, dq, payload) in coriolis_cases() {
+        let mass_derivative = (model.mass(&(q + dq * step), &payload) - model.mass(&(q - dq * step), &payload)) / (2.0 * step);
+        let n = mass_derivative - 2.0 * model.coriolis_matrix(&q, &dq, &payload);
+        assert!((n + n.transpose()).norm() < 1e-7, "Ṁ − 2C not skew-symmetric: {}", (n + n.transpose()).norm());
+    }
+}
+
 /// Model whose outputs are simple functions of its inputs, so tests can tell which inputs it received.
 struct EchoModel;
 
@@ -333,6 +400,10 @@ impl RobotModel for EchoModel {
 
     fn coriolis(&self, _q: &JointVector, dq: &JointVector, _payload: &RigidBodyInertia) -> JointVector {
         *dq
+    }
+
+    fn coriolis_matrix(&self, q: &JointVector, dq: &JointVector, payload: &RigidBodyInertia) -> CoriolisMatrix {
+        CoriolisMatrix::from_diagonal(dq) * (q[0] + payload.mass)
     }
 
     fn gravity(&self, _q: &JointVector, _payload: &RigidBodyInertia, gravity: &Vector3<f64>) -> JointVector {
@@ -359,6 +430,7 @@ fn from_state_methods_forward_state_fields() {
     assert_eq!(model.body_jacobian_from_state(Frame::Flange, &state)[(0, 0)], 0.3);
     assert!((model.mass_from_state(&state)[(0, 0)] - 1.0).abs() < 1e-12);
     assert_eq!(model.coriolis_from_state(&state), JointVector::from(state.dq));
+    assert!((model.coriolis_matrix_from_state(&state) - CoriolisMatrix::from_diagonal(&JointVector::from(state.dq)) * 1.1).norm() < 1e-12);
     assert_eq!(model.gravity_from_state(&state)[0], -9.7);
 }
 
@@ -382,7 +454,7 @@ fn frame_from_index(index: usize) -> Frame {
 /// Builds an isometry from a column-major 4x4 transform.
 fn isometry_from_columns(columns: &[f64]) -> Isometry3<f64> {
     let matrix: [f64; 16] = columns.try_into().expect("16 values");
-    crate::types::CartesianPose::from_column_major(&matrix).inner
+    crate::types::isometry_from_column_major(&matrix)
 }
 
 /// Builds a payload from a mass, a 3-element centre of mass, and a 9-element inertia (about the
@@ -415,6 +487,7 @@ fn model_matches_libfranka() {
     let dynamics_tolerance = 1e-4;
 
     let mut cases = 0;
+    let mut largest_coriolis_matrix_difference: f64 = 0.0;
     for line in text.lines() {
         let mut fields = line.split(' ');
         let tag = fields.next().expect("tag");
@@ -466,6 +539,17 @@ fn model_matches_libfranka() {
                 let load = payload_from(v[23], &v[24..27], &v[14..23]);
                 assert_close(model.coriolis(&q, &dq, &load).as_slice(), &v[30..37], dynamics_tolerance);
             }
+            "coriolis_matrix" => {
+                assert_eq!(v.len(), 76, "coriolis_matrix: field count");
+                let q = JointVector::from_column_slice(&v[0..7]);
+                let dq = JointVector::from_column_slice(&v[7..14]);
+                let load = payload_from(v[23], &v[24..27], &v[14..23]);
+                let actual = model.coriolis_matrix(&q, &dq, &load);
+                let largest = actual.iter().zip(&v[27..76]).map(|(a, e)| (a - e).abs()).fold(0.0, f64::max);
+                largest_coriolis_matrix_difference = largest_coriolis_matrix_difference.max(largest);
+                // Both evaluate the same algorithm, so agreement is at rounding level.
+                assert_close(actual.as_slice(), &v[27..76], 1e-12);
+            }
             "gravity" => {
                 assert_eq!(v.len(), 21, "gravity: field count");
                 let q = JointVector::from_column_slice(&v[0..7]);
@@ -478,4 +562,5 @@ fn model_matches_libfranka() {
         cases += 1;
     }
     assert!(cases > 0, "no cases in {path}");
+    eprintln!("largest |franka-rs - pinocchio| Coriolis matrix element: {largest_coriolis_matrix_difference:e}");
 }

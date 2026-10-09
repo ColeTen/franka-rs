@@ -97,9 +97,6 @@ pub enum FrankaError {
     #[error("command rejected: {message}")]
     Command { message: String },
 
-    #[error("realtime error: {message}")]
-    Realtime { message: String },
-
     #[error("model error: {message}")]
     Model { message: String },
 

@@ -16,13 +16,17 @@ pub struct JointVelocities(pub [f64; NUM_JOINTS]);
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Torques(pub [f64; NUM_JOINTS]);
 
-/// Cartesian pose as a homogeneous transformation (column-major 4x4 matrix).
+/// Cartesian pose command: the end-effector pose in the base frame and an optional elbow.
 ///
-/// Internally stored as `nalgebra::Isometry3<f64>` for proper SE(3) semantics,
-/// but convertible to/from the column-major `[f64; 16]` wire format.
+/// The pose is stored exactly as given, as a column-major 4x4 homogeneous transformation (the
+/// robot's format), and sent unchanged when filtering and rate limiting are off. It is checked to
+/// be a homogeneous transformation when it becomes a command, as libfranka does. Use
+/// [`CartesianPose::from_isometry`] and [`CartesianPose::to_isometry`] for pose arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CartesianPose {
-    pub inner: Isometry3<f64>,
+    /// End-effector pose in the base frame, column-major 4x4 homogeneous transformation.
+    pub o_t_ee: [f64; 16],
+    /// Elbow configuration: the joint-3 angle (rad) and the sign of joint 4 (+1 or -1).
     pub elbow: Option<[f64; 2]>,
 }
 
@@ -117,11 +121,11 @@ impl Torques {
 }
 
 impl CartesianPose {
+    /// Returns the pose of `isometry`, without an elbow.
     pub fn from_isometry(isometry: Isometry3<f64>) -> Self {
-        Self {
-            inner: isometry,
-            elbow: None,
-        }
+        let mut o_t_ee = [0.0; 16];
+        o_t_ee.copy_from_slice(isometry.to_homogeneous().as_slice());
+        Self { o_t_ee, elbow: None }
     }
 
     pub fn with_elbow(mut self, elbow: [f64; 2]) -> Self {
@@ -129,26 +133,36 @@ impl CartesianPose {
         self
     }
 
-    /// Create from a column-major 4x4 homogeneous transformation matrix.
+    /// Returns the pose of a column-major 4x4 homogeneous transformation, stored exactly as given,
+    /// without an elbow.
     pub fn from_column_major(data: &[f64; 16]) -> Self {
-        let mat = Matrix4::from_column_slice(data);
-        let isometry = Isometry3::from_parts(
-            Vector3::new(mat[(0, 3)], mat[(1, 3)], mat[(2, 3)]).into(),
-            UnitQuaternion::from_matrix(&mat.fixed_view::<3, 3>(0, 0).into()),
-        );
-        Self {
-            inner: isometry,
-            elbow: None,
-        }
+        Self { o_t_ee: *data, elbow: None }
     }
 
-    /// Convert to a column-major 4x4 homogeneous transformation matrix.
+    /// Returns the pose as a column-major 4x4 homogeneous transformation, exactly as stored.
     pub fn to_column_major(&self) -> [f64; 16] {
-        let mat = self.inner.to_homogeneous();
-        let mut out = [0.0; 16];
-        out.copy_from_slice(mat.as_slice());
-        out
+        self.o_t_ee
     }
+
+    /// Returns the pose as an isometry.
+    ///
+    /// # Errors
+    /// [`crate::errors::FrankaError::InvalidArgument`] if the stored matrix is not finite or not a
+    /// homogeneous transformation; an invalid matrix is reported, never repaired.
+    pub fn to_isometry(&self) -> crate::errors::FrankaResult<Isometry3<f64>> {
+        crate::command_checks::check_matrix(&self.o_t_ee)?;
+        Ok(isometry_from_column_major(&self.o_t_ee))
+    }
+}
+
+/// Returns the isometry of a column-major 4x4 transformation: its translation, and the unit
+/// quaternion nearest to its rotation block.
+pub(crate) fn isometry_from_column_major(data: &[f64; 16]) -> Isometry3<f64> {
+    let mat = Matrix4::from_column_slice(data);
+    Isometry3::from_parts(
+        Vector3::new(mat[(0, 3)], mat[(1, 3)], mat[(2, 3)]).into(),
+        UnitQuaternion::from_matrix(&mat.fixed_view::<3, 3>(0, 0).into()),
+    )
 }
 
 impl CartesianVelocities {
@@ -296,10 +310,22 @@ mod tests {
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
         let pose = CartesianPose::from_column_major(&identity);
-        let back = pose.to_column_major();
-        for (a, b) in identity.iter().zip(back.iter()) {
-            assert!((a - b).abs() < 1e-10);
-        }
+        assert_eq!(pose.to_column_major(), identity);
+    }
+
+    #[test]
+    fn cartesian_pose_keeps_matrix_bits_and_reports_invalid_matrix() {
+        // A rotation about z by 0.3 rad, slightly off orthonormal in the last bits: stored and
+        // returned exactly, while a matrix with a scaled column cannot become an isometry.
+        let (c, s) = (0.3_f64.cos(), 0.3_f64.sin());
+        let matrix = [c, s, 0.0, 0.0, -s, c, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.1, 0.2, 0.3, 1.0];
+        assert_eq!(CartesianPose::from_column_major(&matrix).to_column_major(), matrix);
+        let mut scaled = matrix;
+        scaled[0] *= 1.01;
+        assert!(matches!(
+            CartesianPose::from_column_major(&scaled).to_isometry(),
+            Err(crate::errors::FrankaError::InvalidArgument { .. })
+        ));
     }
 
     #[test]
@@ -308,7 +334,7 @@ mod tests {
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.5, 0.3, 0.1, 1.0,
         ];
         let pose = CartesianPose::from_column_major(&mat);
-        let t = pose.inner.translation;
+        let t = pose.to_isometry().unwrap().translation;
         assert!((t.x - 0.5).abs() < 1e-10);
         assert!((t.y - 0.3).abs() < 1e-10);
         assert!((t.z - 0.1).abs() < 1e-10);

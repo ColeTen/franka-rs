@@ -1,12 +1,13 @@
-//! Rigid-body dynamics of a [`KinematicChain`]: inverse dynamics, gravity torques, and mass matrix.
+//! Rigid-body dynamics of a [`KinematicChain`]: inverse dynamics, gravity torques, mass matrix, and
+//! Coriolis matrix.
 //!
 //! All functions take the payload rigidly attached to the flange, expressed in the flange frame.
 
-use nalgebra::{Isometry3, Vector3};
+use nalgebra::{Isometry3, Matrix6, Vector3, Vector6};
 
 use super::chain::KinematicChain;
 use super::spatial::{RigidBodyInertia, SpatialForce, SpatialMotion};
-use super::{JointVector, MassMatrix};
+use super::{CoriolisMatrix, JointVector, MassMatrix};
 use crate::constants::NUM_JOINTS;
 
 /// Returns the pose of every joint frame in its parent joint's frame at joint positions `q`.
@@ -115,4 +116,68 @@ pub fn mass_matrix(chain: &KinematicChain, payload: &RigidBodyInertia, q: &Joint
     }
     mass.fill_lower_triangle_with_upper_triangle();
     mass
+}
+
+/// Returns the Coriolis matrix C(q, dq) computed by pinocchio's `computeCoriolisMatrix` algorithm,
+/// so that `C * dq` is the Coriolis and centrifugal torque vector.
+///
+/// Forward pass, in the world frame: each joint's motion subspace column `J`, its derivative
+/// `dJ = v × J`, the link inertia `Y` and the matrix `B = Y.variation(v/2) + force_cross(Y v / 2)`.
+/// Backward pass: the rows of C from the composite inertias and `B` of each subtree.
+pub fn coriolis_matrix(chain: &KinematicChain, payload: &RigidBodyInertia, q: &JointVector, dq: &JointVector) -> CoriolisMatrix {
+    let inertias = chain.inertias_with_payload(payload);
+    let parent_from_joint = parent_from_joint_poses(chain, q);
+
+    let mut columns = [Vector6::zeros(); NUM_JOINTS];
+    let mut column_derivatives = [Vector6::zeros(); NUM_JOINTS];
+    let mut composite_inertias = [Matrix6::zeros(); NUM_JOINTS];
+    let mut velocity_product_matrices = [Matrix6::zeros(); NUM_JOINTS];
+    let mut world_pose = Isometry3::identity();
+    let mut velocity = SpatialMotion::zero();
+    for joint_index in 0..NUM_JOINTS {
+        world_pose *= parent_from_joint[joint_index];
+        let column = SpatialMotion::revolute(&chain.joints[joint_index].axis, 1.0).act(&world_pose);
+        velocity = SpatialMotion {
+            linear: velocity.linear + column.linear * dq[joint_index],
+            angular: velocity.angular + column.angular * dq[joint_index],
+        };
+        let world_inertia = inertias[joint_index].transformed(&world_pose);
+        let momentum = world_inertia.apply(&velocity);
+        let scaled_by_half = |value: Vector3<f64>| value * 0.5;
+        columns[joint_index] = column.to_vector();
+        column_derivatives[joint_index] = velocity.cross_motion(&column).to_vector();
+        composite_inertias[joint_index] = world_inertia.spatial_matrix();
+        velocity_product_matrices[joint_index] = world_inertia.variation(&SpatialMotion {
+            linear: scaled_by_half(velocity.linear),
+            angular: scaled_by_half(velocity.angular),
+        }) + SpatialForce {
+            linear: scaled_by_half(momentum.linear),
+            angular: scaled_by_half(momentum.angular),
+        }
+        .cross_matrix();
+    }
+
+    let mut coriolis = CoriolisMatrix::zeros();
+    let mut force_derivatives = [Vector6::zeros(); NUM_JOINTS];
+    for joint_index in (0..NUM_JOINTS).rev() {
+        let column = &columns[joint_index];
+        force_derivatives[joint_index] = composite_inertias[joint_index] * column_derivatives[joint_index]
+            + velocity_product_matrices[joint_index] * column;
+        for other in joint_index..NUM_JOINTS {
+            coriolis[(joint_index, other)] = column.dot(&force_derivatives[other]);
+        }
+        let momentum_column = composite_inertias[joint_index] * column;
+        let column_times_b = column.transpose() * velocity_product_matrices[joint_index];
+        for ancestor in 0..joint_index {
+            coriolis[(joint_index, ancestor)] = momentum_column.dot(&column_derivatives[ancestor])
+                + (column_times_b * columns[ancestor])[0];
+        }
+        if joint_index > 0 {
+            let (lower, upper) = composite_inertias.split_at_mut(joint_index);
+            lower[joint_index - 1] += upper[0];
+            let (lower, upper) = velocity_product_matrices.split_at_mut(joint_index);
+            lower[joint_index - 1] += upper[0];
+        }
+    }
+    coriolis
 }

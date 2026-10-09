@@ -17,7 +17,7 @@ use self::chain::KinematicChain;
 use crate::constants::NUM_JOINTS;
 use crate::errors::FrankaResult;
 use crate::robot_state::RobotState;
-use crate::types::{CartesianPose, Frame};
+use crate::types::{isometry_from_column_major, Frame};
 
 /// One value per joint, such as positions, velocities, or torques.
 pub type JointVector = SVector<f64, NUM_JOINTS>;
@@ -27,6 +27,9 @@ pub type Jacobian = SMatrix<f64, 6, NUM_JOINTS>;
 
 /// 7×7 joint-space mass matrix.
 pub type MassMatrix = SMatrix<f64, NUM_JOINTS, NUM_JOINTS>;
+
+/// 7×7 Coriolis matrix C(q, dq), with C(q, dq)·dq the Coriolis and centrifugal joint torques.
+pub type CoriolisMatrix = SMatrix<f64, NUM_JOINTS, NUM_JOINTS>;
 
 /// Kinematic and dynamic quantities of the arm.
 ///
@@ -48,6 +51,11 @@ pub trait RobotModel {
 
     /// Returns the Coriolis and centrifugal joint torques, in N·m.
     fn coriolis(&self, q: &JointVector, dq: &JointVector, payload: &RigidBodyInertia) -> JointVector;
+
+    /// Returns the Coriolis matrix C(q, dq), in N·m·s, as computed by pinocchio's
+    /// `computeCoriolisMatrix` (the matrix libfranka's deprecated `coriolis` overload multiplies by
+    /// dq); `coriolis_matrix(q, dq, payload) * dq` equals [`RobotModel::coriolis`].
+    fn coriolis_matrix(&self, q: &JointVector, dq: &JointVector, payload: &RigidBodyInertia) -> CoriolisMatrix;
 
     /// Returns the joint torques that compensate `gravity` (base frame, m/s²), in N·m.
     fn gravity(&self, q: &JointVector, payload: &RigidBodyInertia, gravity: &Vector3<f64>) -> JointVector;
@@ -80,6 +88,11 @@ pub trait RobotModel {
         self.coriolis(&JointVector::from(state.q), &JointVector::from(state.dq), &state.total_load())
     }
 
+    /// Returns [`RobotModel::coriolis_matrix`] at the measured state with its configured total load.
+    fn coriolis_matrix_from_state(&self, state: &RobotState) -> CoriolisMatrix {
+        self.coriolis_matrix(&JointVector::from(state.q), &JointVector::from(state.dq), &state.total_load())
+    }
+
     /// Returns [`RobotModel::gravity`] at the measured state, using the measured base
     /// acceleration `o_ddp_o` as gravity and the configured total load.
     fn gravity_from_state(&self, state: &RobotState) -> JointVector {
@@ -95,8 +108,8 @@ pub trait RobotModel {
 fn configuration_from_state(state: &RobotState) -> (JointVector, Isometry3<f64>, Isometry3<f64>) {
     (
         JointVector::from(state.q),
-        CartesianPose::from_column_major(&state.f_t_ee).inner,
-        CartesianPose::from_column_major(&state.ee_t_k).inner,
+        isometry_from_column_major(&state.f_t_ee),
+        isometry_from_column_major(&state.ee_t_k),
     )
 }
 
@@ -140,6 +153,10 @@ impl RobotModel for Model {
 
     fn coriolis(&self, q: &JointVector, dq: &JointVector, payload: &RigidBodyInertia) -> JointVector {
         dynamics::inverse_dynamics(&self.chain, payload, q, dq, &JointVector::zeros(), &Vector3::zeros())
+    }
+
+    fn coriolis_matrix(&self, q: &JointVector, dq: &JointVector, payload: &RigidBodyInertia) -> CoriolisMatrix {
+        dynamics::coriolis_matrix(&self.chain, payload, q, dq)
     }
 
     fn gravity(&self, q: &JointVector, payload: &RigidBodyInertia, gravity: &Vector3<f64>) -> JointVector {

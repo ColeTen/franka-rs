@@ -2,17 +2,14 @@
 // each case's inputs and libfranka's outputs, for comparison against the franka-rs ports in
 // source/lowpass_filter.rs and source/rate_limiting.rs.
 //
-// Needs only Eigen and libfranka's headers plus the two source files it exercises (no Pinocchio, no
-// built library, no robot), so it compiles natively, e.g.:
+// Links the built libfranka library, so the outputs are those of the exact code franka-rs is
+// compared against (no robot needed):
 //
-//   c++ -std=c++17 -I external/libfranka/include -I /opt/homebrew/include/eigen3 \
-//       validation/reference/computation.cpp \
-//       external/libfranka/src/lowpass_filter.cpp external/libfranka/src/rate_limiting.cpp \
-//       -o computation
-//   ./computation > validation/data/computation_cases.txt
+//   cmake --build validation/reference/build --target computation
+//   validation/reference/build/computation > validation/data/computation_cases.txt
 //
-// Each line is: <tag> <input values...> <output values...>, all full-precision decimals, in the
-// franka-rs argument order. The companion test in source/rate_limiting.rs knows each tag's input
+// Each line is: <tag> <input values...> <output values...>, all decimals that round-trip exactly, in
+// the franka-rs argument order; franka-rs must reproduce every output bit for bit. The companion test in source/rate_limiting.rs knows each tag's input
 // and output counts, re-runs the franka-rs function on the inputs, and compares against the outputs.
 //
 // franka-rs's lowpass_filter_joints has no libfranka counterpart (it is element-wise scalar
@@ -22,6 +19,8 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <cmath>
+#include <random>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -215,6 +214,145 @@ int main() {
       append(inputs, last_twist);
       append(inputs, last_acc);
       emit("limit_rate_cartesian_pose", inputs, std::vector<double>(out.begin(), out.end()));
+    }
+  }
+
+  // --- Randomized cases for the rotation arithmetic (seeded, so the file is reproducible) ---
+  // Rotations are rounded to single precision, as the robot reports them, so they are close to but
+  // not exactly orthonormal; deltas cover unchanged, small, large and near-180-degree rotations.
+  {
+    std::mt19937_64 rng(20261009);
+    std::uniform_real_distribution<double> unit(-1.0, 1.0);
+    auto random_axis = [&]() { return Eigen::Vector3d(unit(rng), unit(rng), unit(rng)).normalized(); };
+    auto as_float = [](const Eigen::Matrix3d& m) {
+      Eigen::Matrix3d r;
+      for (int i = 0; i < 9; i++) r.data()[i] = static_cast<double>(static_cast<float>(m.data()[i]));
+      return r;
+    };
+    const std::array<double, 6> deltas{{0.0, 1e-9, 1e-4, 0.02, 1.0, 3.1}};
+    for (int index = 0; index < 240; index++) {
+      double delta = deltas[index % deltas.size()];
+      Eigen::Matrix3d last_rotation = Eigen::AngleAxisd(3.0 * unit(rng), random_axis()).toRotationMatrix();
+      Eigen::Matrix3d current_rotation = Eigen::AngleAxisd(delta, random_axis()).toRotationMatrix() * last_rotation;
+      if (index % 2 == 0) {
+        last_rotation = as_float(last_rotation);
+        current_rotation = as_float(current_rotation);
+      }
+      Eigen::Vector3d last_translation(0.5 * unit(rng), 0.5 * unit(rng), 0.5 + 0.3 * unit(rng));
+      Eigen::Vector3d current_translation = last_translation + Eigen::Vector3d(unit(rng), unit(rng), unit(rng)) * 0.002;
+      auto last = transform(last_rotation, last_translation);
+      auto current = transform(current_rotation, current_translation);
+
+      double cutoff = index % 3 == 0 ? 100.0 : (index % 3 == 1 ? 10.0 : 900.0);
+      auto filtered = franka::cartesianLowpassFilter(dt, current, last, cutoff);
+      std::vector<double> filter_inputs{dt};
+      append(filter_inputs, current);
+      append(filter_inputs, last);
+      filter_inputs.push_back(cutoff);
+      emit("cartesian_lowpass_filter", filter_inputs, std::vector<double>(filtered.begin(), filtered.end()));
+
+      std::array<double, 6> last_twist{}, last_acc{};
+      for (size_t i = 0; i < 6; i++) {
+        last_twist[i] = 0.5 * unit(rng);
+        last_acc[i] = 4.0 * unit(rng);
+      }
+      auto limited = franka::limitRate(franka::kMaxTranslationalVelocity, franka::kMaxTranslationalAcceleration,
+                                       franka::kMaxTranslationalJerk, franka::kMaxRotationalVelocity,
+                                       franka::kMaxRotationalAcceleration, franka::kMaxRotationalJerk, current,
+                                       last, last_twist, last_acc);
+      std::vector<double> limit_inputs{franka::kMaxTranslationalVelocity, franka::kMaxTranslationalAcceleration,
+                                       franka::kMaxTranslationalJerk, franka::kMaxRotationalVelocity,
+                                       franka::kMaxRotationalAcceleration, franka::kMaxRotationalJerk};
+      append(limit_inputs, current);
+      append(limit_inputs, last);
+      append(limit_inputs, last_twist);
+      append(limit_inputs, last_acc);
+      emit("limit_rate_cartesian_pose", limit_inputs, std::vector<double>(limited.begin(), limited.end()));
+    }
+
+    // Cartesian velocities, including last velocities above the maximum.
+    for (int index = 0; index < 200; index++) {
+      std::array<double, 6> commanded{}, last{}, last_acc{};
+      double reach = index % 4 == 0 ? 4.0 : 1.0;
+      for (size_t i = 0; i < 6; i++) {
+        last[i] = reach * unit(rng);
+        commanded[i] = last[i] + 0.01 * unit(rng);
+        last_acc[i] = 5.0 * unit(rng);
+      }
+      auto out = franka::limitRate(franka::kMaxTranslationalVelocity, franka::kMaxTranslationalAcceleration,
+                                   franka::kMaxTranslationalJerk, franka::kMaxRotationalVelocity,
+                                   franka::kMaxRotationalAcceleration, franka::kMaxRotationalJerk, commanded, last,
+                                   last_acc);
+      std::vector<double> inputs{franka::kMaxTranslationalVelocity, franka::kMaxTranslationalAcceleration,
+                                 franka::kMaxTranslationalJerk, franka::kMaxRotationalVelocity,
+                                 franka::kMaxRotationalAcceleration, franka::kMaxRotationalJerk};
+      append(inputs, commanded);
+      append(inputs, last);
+      append(inputs, last_acc);
+      emit("limit_rate_cartesian_velocity", inputs, std::vector<double>(out.begin(), out.end()));
+    }
+  }
+
+  // --- Edge cases for the rotation arithmetic: exact rotations with zero entries (axis
+  // permutations, 90/180-degree turns), a reflection, a column scaled within the homogeneity
+  // tolerance, an unchanged rotation (pure translation), and a rotation changed by one ulp (the
+  // angle-axis stableNorm path). Each pair is run through both the filter and the pose limiter.
+  {
+    std::vector<Eigen::Matrix3d> rotations;
+    rotations.push_back(Eigen::Matrix3d::Identity());
+    Eigen::Matrix3d permutation;
+    permutation << 0, 1, 0, 0, 0, 1, 1, 0, 0;
+    rotations.push_back(permutation);
+    rotations.push_back(permutation.transpose());
+    for (int axis = 0; axis < 3; axis++) {
+      for (double angle : {M_PI / 2, M_PI, -M_PI / 2}) {
+        Eigen::Matrix3d r = Eigen::AngleAxisd(angle, Eigen::Vector3d::Unit(axis)).toRotationMatrix();
+        for (int i = 0; i < 9; i++) r.data()[i] = std::round(r.data()[i]);  // exact zeros and ones
+        rotations.push_back(r);
+      }
+    }
+    Eigen::Matrix3d reflection = Eigen::Vector3d(1.0, 1.0, -1.0).asDiagonal();
+    rotations.push_back(reflection);
+    Eigen::Matrix3d scaled = Eigen::AngleAxisd(0.7, Eigen::Vector3d(1, 2, 3).normalized()).toRotationMatrix();
+    scaled.col(1) *= 1.0 + 9e-6;
+    rotations.push_back(scaled);
+
+    auto run_pair = [&](const Eigen::Matrix3d& last_rotation, const Eigen::Matrix3d& current_rotation) {
+      auto last = transform(last_rotation, {0.3, -0.1, 0.5});
+      auto current = transform(current_rotation, {0.301, -0.1, 0.5});
+      auto filtered = franka::cartesianLowpassFilter(dt, current, last, 100.0);
+      std::vector<double> filter_inputs{dt};
+      append(filter_inputs, current);
+      append(filter_inputs, last);
+      filter_inputs.push_back(100.0);
+      emit("cartesian_lowpass_filter", filter_inputs, std::vector<double>(filtered.begin(), filtered.end()));
+      std::array<double, 6> zero{};
+      auto limited = franka::limitRate(franka::kMaxTranslationalVelocity, franka::kMaxTranslationalAcceleration,
+                                       franka::kMaxTranslationalJerk, franka::kMaxRotationalVelocity,
+                                       franka::kMaxRotationalAcceleration, franka::kMaxRotationalJerk, current,
+                                       last, zero, zero);
+      std::vector<double> limit_inputs{franka::kMaxTranslationalVelocity, franka::kMaxTranslationalAcceleration,
+                                       franka::kMaxTranslationalJerk, franka::kMaxRotationalVelocity,
+                                       franka::kMaxRotationalAcceleration, franka::kMaxRotationalJerk};
+      append(limit_inputs, current);
+      append(limit_inputs, last);
+      append(limit_inputs, zero);
+      append(limit_inputs, zero);
+      emit("limit_rate_cartesian_pose", limit_inputs, std::vector<double>(limited.begin(), limited.end()));
+    };
+    for (const Eigen::Matrix3d& rotation : rotations) {
+      run_pair(rotation, rotation);  // unchanged rotation
+      Eigen::Matrix3d nudged = rotation;
+      for (int i = 0; i < 9; i++) {
+        if (nudged.data()[i] != 0.0) {
+          nudged.data()[i] = std::nextafter(nudged.data()[i], 2.0);  // one ulp
+          break;
+        }
+      }
+      run_pair(rotation, nudged);
+      for (const Eigen::Matrix3d& other : rotations) {
+        run_pair(rotation, other);
+      }
     }
   }
 
