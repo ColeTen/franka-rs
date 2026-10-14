@@ -5,7 +5,7 @@ authors = ["Cole Ten"]
 language = "en"
 
 [build]
-build-dir = "../docs"
+build-dir = "build"
 
 [output.html]
 default-theme = "rust"

@@ -1,214 +1,57 @@
 # Error Handling
 
-## Overview
-
-`franka-rs` uses a two-tier error system:
-
-1. **`FrankaError`** — application-level errors (network failures, protocol issues, control exceptions, invalid arguments)
-2. **`RobotErrors`** — bitfield of 41 hardware safety flags from the robot controller
-
-```mermaid
-classDiagram
-    class FrankaError {
-        <<enum>>
-        +Network~message, source~
-        +Protocol~message~
-        +IncompatibleVersion~server, library~
-        +Control~message, log~
-        +Command~message~
-        +Model~message~
-        +InvalidOperation~message~
-        +InvalidArgument~message~
-    }
-
-    class RobotErrors {
-        <<bitflags>>
-        +JOINT_POSITION_LIMITS_VIOLATION
-        +CARTESIAN_POSITION_LIMITS_VIOLATION
-        +SELF_COLLISION_AVOIDANCE_VIOLATION
-        +JOINT_VELOCITY_VIOLATION
-        +...41 flags total
-        +from_bool_array(&[bool; 41]) Self
-        +has_errors() bool
-    }
-
-    class FrankaResult~T~ {
-        Result~T, FrankaError~
-    }
-
-    FrankaError ..> RobotErrors : Control messages include last_motion_errors
-    FrankaResult --> FrankaError : Err variant
-```
+- **`FrankaError`** — errors of franka-rs operations; `FrankaResult<T> = Result<T, FrankaError>`
+  is returned by every fallible public method.
+- **`RobotErrors`** — the robot's 41 safety and error flags (`bitflags`), in
+  `RobotState::current_errors` and `last_motion_errors`.
 
 ## `FrankaError`
 
-The main error type, implementing `std::error::Error` and `Display` via `thiserror`:
-
-| Variant | Cause | Contains |
-|---------|-------|----------|
-| `Network` | TCP/UDP failure, timeout, unreachable host | `message`, optional `io::Error` source |
-| `Protocol` | Malformed packets, unexpected response format | `message` |
-| `IncompatibleVersion` | Server/client version mismatch during handshake | `server_version`, `library_version` |
-| `Control` | The robot ended or rejected a running motion, or a misuse libfranka reports as a `ControlException` | `message`, `log: Vec<RobotState>` (currently always empty) |
-| `Command` | Robot rejected a configuration command | `message` |
-| `Model` | The robot's URDF cannot be used: invalid XML, not a serial chain of seven revolute joints ending in `link8`, missing joint velocity limits | `message` |
-| `InvalidOperation` | Attempted operation in wrong state | `message` |
-| `InvalidArgument` | Invalid command or filter/limiter input: non-finite value, cutoff frequency or sample time out of range, pose not a homogeneous transformation, elbow sign not ±1 (libfranka's `std::invalid_argument`) | `message` |
-
-### Pattern Matching
+| Variant | Cause | Fields |
+|---------|-------|--------|
+| `Network` | TCP/UDP failure, timeout, closed connection | `message`, `source: Option<io::Error>` |
+| `Protocol` | Malformed or unexpected message | `message` |
+| `IncompatibleVersion` | Handshake version mismatch | `server_version`, `library_version` |
+| `Control` | The robot ended or rejected a running motion (the message includes `last_motion_errors`), or misuse libfranka reports as a `ControlException` | `message`, `log` (always empty) |
+| `Command` | The robot rejected a command | `message` |
+| `Model` | Unusable URDF: invalid XML, not a serial chain of seven revolute joints ending in `link8`, missing joint velocity limits | `message` |
+| `InvalidOperation` | Operation in the wrong state (finished session, wrong controller mode) | `message` |
+| `InvalidArgument` | Invalid command or filter/limiter input: non-finite value, cutoff or sample time out of range, non-homogeneous pose, elbow sign not ±1 (libfranka's `std::invalid_argument`) | `message` |
 
 ```rust
-use franka_rs::errors::{FrankaError, FrankaResult};
-
-fn try_connect() -> FrankaResult<()> {
-    let robot = Robot::connect("172.16.0.2")?;
-    Ok(())
-}
-
-match try_connect() {
-    Ok(()) => println!("Connected!"),
-    Err(FrankaError::Network { message, source }) => {
-        eprintln!("Network: {message}");
-        if let Some(io_err) = source {
-            eprintln!("  IO error: {io_err}");
-        }
-    }
-    Err(FrankaError::IncompatibleVersion { server_version, library_version }) => {
-        eprintln!("Version mismatch: server={server_version}, lib={library_version}");
-    }
-    Err(FrankaError::Control { message, .. }) => {
-        // The message includes the robot's last_motion_errors when the robot ended the motion.
-        eprintln!("Control error: {message}");
-    }
-    Err(FrankaError::InvalidArgument { message }) => {
-        eprintln!("Invalid command or input: {message}");
-    }
-    Err(e) => eprintln!("Other: {e}"),
+match robot.control_torques(&config, callback) {
+    Ok(log) => println!("{} cycles", log.len()),
+    Err(FrankaError::Control { message, .. }) => eprintln!("Motion ended: {message}"),
+    Err(FrankaError::InvalidArgument { message }) => eprintln!("Invalid command: {message}"),
+    Err(FrankaError::Network { message, .. }) => eprintln!("Network: {message}"),
+    Err(e) => eprintln!("{e}"),
 }
 ```
 
-### Constructor Helpers
+Constructors: `FrankaError::network(message)`, `FrankaError::network_with_source(message, io_error)`.
+
+## `RobotErrors`
+
+| Category | Flags |
+|----------|-------|
+| Limits | `JOINT_POSITION_LIMITS_VIOLATION`, `CARTESIAN_POSITION_LIMITS_VIOLATION`, `JOINT_VELOCITY_VIOLATION`, `CARTESIAN_VELOCITY_VIOLATION`, `TAU_J_RANGE_VIOLATION`, `POWER_LIMIT_VIOLATION` |
+| Collision | `SELF_COLLISION_AVOIDANCE_VIOLATION`, `JOINT_REFLEX`, `CARTESIAN_REFLEX` |
+| Motion generator | `JOINT_MOTION_GENERATOR_*` and `CARTESIAN_MOTION_GENERATOR_*` (limits, discontinuities, elbow), `JOINT_POSITION_MOTION_GENERATOR_START_POSE_INVALID`, `CARTESIAN_POSITION_MOTION_GENERATOR_START_POSE_INVALID`, `CARTESIAN_POSITION_MOTION_GENERATOR_INVALID_FRAME`, `START_ELBOW_SIGN_INCONSISTENT`, `MAX_GOAL_POSE_DEVIATION_VIOLATION`, `MAX_PATH_POSE_DEVIATION_VIOLATION`, `CARTESIAN_SPLINE_MOTION_GENERATOR_VIOLATION`, `JOINT_VIA_MOTION_GENERATOR_PLANNING_JOINT_LIMIT_VIOLATION`, `JOINT_P2P_INSUFFICIENT_TORQUE_FOR_PLANNING` |
+| Controller | `CONTROLLER_TORQUE_DISCONTINUITY`, `FORCE_CONTROL_SAFETY_VIOLATION`, `FORCE_CONTROLLER_DESIRED_FORCE_TOLERANCE_VIOLATION`, `INSTABILITY_DETECTED`, `JOINT_MOVE_IN_WRONG_DIRECTION` |
+| Other | `COMMUNICATION_CONSTRAINTS_VIOLATION`, `CARTESIAN_VELOCITY_PROFILE_SAFETY_VIOLATION`, `BASE_ACCELERATION_INITIALIZATION_TIMEOUT`, `BASE_ACCELERATION_INVALID_READING` |
 
 ```rust
-// Simple network error
-let err = FrankaError::network("connection refused");
-
-// Network error with IO source
-let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout");
-let err = FrankaError::network_with_source("UDP receive", io_err);
-```
-
-## `RobotErrors` (Bitflags)
-
-A 64-bit bitfield where each bit corresponds to a specific safety violation. Uses the `bitflags` crate.
-
-### Error Categories
-
-```mermaid
-mindmap
-  root((RobotErrors))
-    Position Limits
-      JOINT_POSITION_LIMITS_VIOLATION
-      CARTESIAN_POSITION_LIMITS_VIOLATION
-    Velocity Limits
-      JOINT_VELOCITY_VIOLATION
-      CARTESIAN_VELOCITY_VIOLATION
-    Collision
-      SELF_COLLISION_AVOIDANCE_VIOLATION
-      JOINT_REFLEX
-      CARTESIAN_REFLEX
-    Motion Generator
-      JOINT_MOTION_GENERATOR_POSITION_LIMITS_VIOLATION
-      JOINT_MOTION_GENERATOR_VELOCITY_LIMITS_VIOLATION
-      JOINT_MOTION_GENERATOR_VELOCITY_DISCONTINUITY
-      JOINT_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY
-      CARTESIAN_MOTION_GENERATOR_VELOCITY_LIMITS_VIOLATION
-      CARTESIAN_MOTION_GENERATOR_VELOCITY_DISCONTINUITY
-      CARTESIAN_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY
-    Controller
-      CONTROLLER_TORQUE_DISCONTINUITY
-      FORCE_CONTROL_SAFETY_VIOLATION
-      FORCE_CONTROLLER_DESIRED_FORCE_TOLERANCE_VIOLATION
-    Communication
-      COMMUNICATION_CONSTRAINTS_VIOLATION
-    Power
-      POWER_LIMIT_VIOLATION
-      TAU_J_RANGE_VIOLATION
-    Stability
-      INSTABILITY_DETECTED
-      JOINT_MOVE_IN_WRONG_DIRECTION
-```
-
-### Usage
-
-```rust
-use franka_rs::errors::RobotErrors;
-
 let state = robot.read_once()?;
-
-if state.current_errors.has_errors() {
-    // Check specific errors
-    if state.current_errors.contains(RobotErrors::JOINT_VELOCITY_VIOLATION) {
-        eprintln!("Joint velocity limit exceeded!");
-    }
-    if state.current_errors.contains(RobotErrors::SELF_COLLISION_AVOIDANCE_VIOLATION) {
-        eprintln!("Self-collision detected!");
-    }
-
-    // Iterate active errors
-    println!("Active errors: {:?}", state.current_errors);
-}
-
-// Check last motion errors (persists after recovery)
 if state.last_motion_errors.contains(RobotErrors::CARTESIAN_REFLEX) {
-    println!("Last motion was stopped by Cartesian reflex");
+    println!("Last motion was stopped by a Cartesian reflex");
 }
+println!("Active errors: {:?}", state.current_errors);
 ```
 
-### Wire Format Conversion
+The robot sends the flags as `[u8; 41]`, converted to `[bool; 41]`; `RobotErrors::from_bool_array`
+builds the set from that, and `has_errors` reports whether any is active.
 
-The robot sends errors as a `[u8; 41]` array (one byte per flag), converted to `[bool; 41]` and then to `RobotErrors`:
+## Recovery
 
-```rust
-let bools = [false; 41];
-let errors = RobotErrors::from_bool_array(&bools);
-assert!(!errors.has_errors());
-```
-
-## `FrankaResult<T>`
-
-Convenience alias used throughout the library:
-
-```rust
-pub type FrankaResult<T> = Result<T, FrankaError>;
-```
-
-Every fallible public method returns `FrankaResult<T>`, making `?` propagation ergonomic:
-
-```rust
-fn do_work() -> FrankaResult<()> {
-    let mut robot = Robot::connect("172.16.0.2")?;
-    let state = robot.read_once()?;
-    robot.control_torques(&MotionConfig::default(), |state, _| {
-        ControlFlow::Break(Torques::new([0.0; 7]))
-    })?;
-    Ok(())
-}
-```
-
-## Error Recovery
-
-After a collision or safety violation:
-
-```rust
-// Attempt automatic recovery
-match robot.automatic_error_recovery() {
-    Ok(()) => println!("Recovery successful"),
-    Err(e) => {
-        eprintln!("Recovery failed: {e}");
-        eprintln!("Manual intervention required (check Desk UI)");
-    }
-}
-```
-
-If recovery fails, `automatic_error_recovery` returns the robot's rejection as `FrankaError::Command`.
+After a reflex, `robot.automatic_error_recovery()` clears the errors; if the robot rejects it,
+the error is `FrankaError::Command`. See [Safety & Error Recovery](../design/safety.md).

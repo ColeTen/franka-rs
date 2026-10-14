@@ -1,178 +1,78 @@
 # Rate Limiting
 
-## Overview
+`rate_limiting` ports libfranka's `limitRate` functions: it limits velocity, acceleration and jerk
+of joint, elbow and Cartesian commands, and the rate of torques. Outputs are bit-identical to
+libfranka 0.21.3 as built on the test machine (`tests/computation_test.rs`; another libfranka
+build can round differently). The control loops apply it when `MotionConfig::limit_rate` is on
+(the default); active control does not.
 
-The `rate_limiting` module limits the velocity, acceleration and jerk of joint and Cartesian
-commands, and the rate of torque commands, as libfranka's `limitRate` functions do. Its outputs
-are bit-identical to libfranka 0.21.3 as built on the test machine (another libfranka build can round differently) (`tests/computation_test.rs`). The control loops apply it
-when `MotionConfig::limit_rate` is on (the default); the active interface does not.
-
-Every public function checks its input first and returns `FrankaError::InvalidArgument` if a
-commanded value is not finite (and, for poses, if the commanded matrix is not a homogeneous
-transformation), as libfranka throws `std::invalid_argument`. All return `FrankaResult`.
-
-```mermaid
-flowchart LR
-    CMD["User command<br/>(may exceed limits)"] --> CHECK{"Finite?<br/>(pose: homogeneous?)"}
-    CHECK -->|No| ERR["Err(InvalidArgument)"]
-    CHECK -->|Yes| RL["Rate Limiter"]
-    RL --> SAFE["Bounded command"]
-```
+Each function first checks that the commanded values are finite (and, for poses, that the matrix
+is a homogeneous transformation) and returns `FrankaError::InvalidArgument` otherwise, as
+libfranka throws `std::invalid_argument`. All return `FrankaResult`.
 
 ## Limits
 
-Each limit is reduced by `LIMIT_EPS = 1e-3`.
+Each value is reduced by `LIMIT_EPS = 1e-3`.
 
-### Joint Limits
-
-| Quantity | Value | Unit |
-|----------|-------|------|
-| Max velocity | Position-dependent, from the robot's URDF (`JointVelocityLimits`), tightened by `JOINT_VELOCITY_LIMITS_TOLERANCE` | rad/s |
-| Max acceleration | 10.0 | rad/s² |
-| Max jerk | 5000.0 | rad/s³ |
-| Max torque rate | 1000.0 | Nm/s |
-
-### Cartesian Limits
-
-| Quantity | Translational | Rotational | Unit |
-|----------|--------------|------------|------|
-| Max velocity | 3.0 | 2.5 | m/s, rad/s |
-| Max acceleration | 9.0 | 17.0 | m/s², rad/s² |
-| Max jerk | 4500.0 | 8500.0 | m/s³, rad/s³ |
+| Quantity | Velocity | Acceleration | Jerk |
+|----------|----------|--------------|------|
+| Joints | from the URDF, position-dependent (`JointVelocityLimits`, less `JOINT_VELOCITY_LIMITS_TOLERANCE`) | 10 rad/s² | 5000 rad/s³ |
+| Cartesian translation | 3.0 m/s | 9 m/s² | 4500 m/s³ |
+| Cartesian rotation | 2.5 rad/s | 17 rad/s² | 8500 rad/s³ |
+| Elbow | 1.5 rad/s | 10 rad/s² | 5000 rad/s³ |
+| Torque rate | — | — | 1000 Nm/s (`MAX_TORQUE_RATE`) |
 
 `limit_rate_cartesian_pose` scales the rotational limits by
 `FACTOR_CARTESIAN_ROTATION_POSE_INTERFACE = 0.99`.
 
-### Elbow Limits
+`JointVelocityLimits::from_urdf(&urdf)` reads the position-dependent limits; `upper(&q)` and
+`lower(&q)` give the velocity bounds at joint positions `q` (`Robot::connect` builds it; `Default`
+is all zero).
 
-| Quantity | Value | Unit |
-|----------|-------|------|
-| Max velocity | 1.5 | rad/s |
-| Max acceleration | 10.0 | rad/s² |
-| Max jerk | 5000.0 | rad/s³ |
+## Functions
 
-## Public Functions
-
-### `limit_rate_torques`
-
-Limits the time derivative of per-joint torque commands:
-
-```rust
-let limited = limit_rate_torques(
-    &MAX_TORQUE_RATE,  // max derivative per joint (Nm/s)
-    &commanded,        // desired torques
-    &last_commanded,   // previous cycle's torques (robot state tau_j_d)
-)?;
-```
-
-### `limit_rate_velocity` and `limit_rate_position`
-
-Limit one value through the jerk → acceleration → velocity cascade below;
-`limit_rate_position` converts the position step to a velocity first.
-
-### `limit_rate_joint_positions` and `limit_rate_joint_velocities`
-
-Apply the scalar functions to each joint:
+| Function | Limits | Extra inputs |
+|----------|--------|--------------|
+| `limit_rate_torques(max_rate, cmd, last)` | torque rate per joint | last commanded torques |
+| `limit_rate_velocity`, `limit_rate_position` | one value | velocity limits, max accel/jerk, last velocity and acceleration (position: also last position) |
+| `limit_rate_joint_velocities`, `limit_rate_joint_positions` | 7 joints (the scalar functions per joint) | per-joint arrays |
+| `limit_rate_cartesian_velocity` | 6D twist `[v; ω]`, each part as a 3-vector | last twist and acceleration |
+| `limit_rate_cartesian_pose` | 4×4 pose via its implied twist | last pose, twist, acceleration |
 
 ```rust
 let limited = limit_rate_joint_positions(
-    &upper_velocity_limits,
-    &lower_velocity_limits,
-    &max_acceleration,
-    &max_jerk,
-    &commanded,
-    &last_commanded,
-    &last_velocity,
-    &last_acceleration,
+    &upper_velocity, &lower_velocity, &MAX_JOINT_ACCELERATION, &MAX_JOINT_JERK,
+    &commanded, &last_commanded, &last_velocity, &last_acceleration,
 )?;
 ```
 
-### `limit_rate_cartesian_velocity`
+## Algorithm
 
-Limits a 6D twist `[vx, vy, vz, wx, wy, wz]`, translation and rotation each as a 3-vector:
-
-```rust
-let limited = limit_rate_cartesian_velocity(
-    MAX_TRANSLATIONAL_VELOCITY,
-    MAX_TRANSLATIONAL_ACCELERATION,
-    MAX_TRANSLATIONAL_JERK,
-    MAX_ROTATIONAL_VELOCITY,
-    MAX_ROTATIONAL_ACCELERATION,
-    MAX_ROTATIONAL_JERK,
-    &commanded_twist,
-    &last_twist,
-    &last_acceleration,
-)?;
-```
-
-### `limit_rate_cartesian_pose`
-
-Limits a 4×4 pose by computing the implied twist, limiting it, and integrating back. The rotation
-of each pose is taken as Eigen's `Affine3d::rotation()` does (polar decomposition by a Jacobi
-SVD) and the rotation difference as an angle-axis; this arithmetic reproduces libfranka's exactly
-(`eigen_compat`).
+**Per value (joints, elbow):**
 
 ```mermaid
-flowchart LR
-    POSE_CMD["Commanded pose<br/>(4x4 matrix)"] --> DIFF["Differentiate<br/>pose → twist"]
-    DIFF --> LIMIT["limit_rate_cartesian_velocity<br/>(rotation × 0.99)"]
-    LIMIT --> INTEGRATE["Integrate<br/>twist → pose<br/>(Rodrigues' formula)"]
-    INTEGRATE --> POSE_OUT["Limited pose<br/>(4x4 matrix)"]
+flowchart TB
+    A["Jerk from the commanded change"] --> B["Limit to ±max_jerk"]
+    B --> C["Integrate → acceleration"]
+    C --> D["Limit to the safe acceleration bounds"]
+    D --> E["Integrate → velocity (→ position)"]
 ```
 
-```rust
-let limited = limit_rate_cartesian_pose(
-    MAX_TRANSLATIONAL_VELOCITY,
-    MAX_TRANSLATIONAL_ACCELERATION,
-    MAX_TRANSLATIONAL_JERK,
-    MAX_ROTATIONAL_VELOCITY,
-    MAX_ROTATIONAL_ACCELERATION,
-    MAX_ROTATIONAL_JERK,
-    &commanded_pose,     // [f64; 16] column-major
-    &last_commanded,     // [f64; 16]
-    &last_twist,         // [f64; 6]
-    &last_acceleration,  // [f64; 6]
-)?;
+```
+safe_max_accel = min((max_jerk / max_accel) · (upper_vel_limit − last_vel),  max_accel)
+safe_min_accel = max((max_jerk / max_accel) · (lower_vel_limit − last_vel), −max_accel)
 ```
 
-## Limiting Algorithm
+so the value can always slow down before a velocity limit. `min`/`max` follow C++
+`std::min`/`std::max` exactly, including for NaN.
 
-### Joints and Elbow (per value)
+**Per 3-vector (Cartesian):** the jerk is limited by its norm; the acceleration's norm by
+`min((max_jerk / max_accel) · d, max_accel)`, with `d` the distance from the last velocity to the
+maximum-velocity sphere along the acceleration.
 
-```mermaid
-flowchart TD
-    CMD["Commanded value"] --> D3["Jerk from the commanded change"]
-    D3 --> CLAMP3["Limit to ±max_jerk"]
-    CLAMP3 --> INT3["Integrate → acceleration"]
-    INT3 --> SAFE["Safe acceleration bounds<br/>from the velocity limits"]
-    SAFE --> CLAMP2["Limit to safe bounds"]
-    CLAMP2 --> INT2["Integrate → velocity (→ position)"]
-    INT2 --> OUT["Limited output"]
-```
+**Pose:** the pose difference gives a twist (rotation as Eigen's `Affine3d::rotation()` and
+angle-axis, reproduced in `eigen_compat`), the twist is limited, and integrated back with
+Rodrigues' formula.
 
-The safe acceleration bounds are:
-
-```
-safe_max_accel = min((max_jerk / max_accel) * (upper_vel_limit - last_vel), max_accel)
-safe_min_accel = max((max_jerk / max_accel) * (lower_vel_limit - last_vel), -max_accel)
-```
-
-so the value can always decelerate before reaching a velocity limit. The minimum and maximum
-follow C++ `std::min`/`std::max` exactly, including for NaN.
-
-### Cartesian (per 3-vector)
-
-Jerk is limited by its norm, the acceleration is integrated, and the acceleration's norm is
-limited by `min((max_jerk / max_accel) * d, max_accel)`, where `d` is the distance from the last
-velocity to the maximum-velocity sphere along the acceleration direction.
-
-## When Rate Limiting Activates
-
-For a smooth trajectory within the limits, the output is the input up to rounding. Otherwise:
-
-- **Velocity violations** → velocity limited
-- **Acceleration violations** → acceleration bounded, trajectory smoothed
-- **Jerk violations** → jerk bounded, preventing sharp transients
-
-> **Note**: Rate limiting prevents some robot reflexes but introduces tracking error. If your
-> trajectory regularly triggers it, use smoother profiles.
+A smooth command within the limits passes through unchanged up to rounding. Limiting avoids some
+robot reflexes at the cost of tracking error; prefer trajectories that stay within the limits.

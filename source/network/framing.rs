@@ -1,18 +1,22 @@
+use std::marker::PhantomData;
+
 use crate::errors::{FrankaError, FrankaResult};
-use crate::wire::robot::CommandHeader;
+
+use super::header::MessageHeader;
 
 /// Largest message buffer (bytes) reserved before any payload byte has arrived.
 const MAX_PREALLOCATION: usize = 64 * 1024;
 
 /// Handles TCP message framing: assembles partial reads into complete messages.
 ///
-/// The protocol uses a fixed-size header (CommandHeader: 12 bytes) followed by
-/// a variable-length payload. The header's `size` field gives the total message
-/// size (including the header itself).
-pub(super) struct TcpFraming {
+/// Each message is a fixed-size header `H` followed by a variable-length payload. The header's
+/// `size` field gives the total message size (including the header itself).
+pub(super) struct TcpFraming<H> {
     state: FramingState,
     /// Header bytes received so far while no header is complete (reads can split a header).
     partial_header: Vec<u8>,
+    /// The header layout of the protocol being framed.
+    header: PhantomData<fn() -> H>,
 }
 
 enum FramingState {
@@ -26,11 +30,12 @@ enum FramingState {
     },
 }
 
-impl TcpFraming {
+impl<H: MessageHeader> TcpFraming<H> {
     pub fn new() -> Self {
         Self {
             state: FramingState::Idle,
-            partial_header: Vec::with_capacity(CommandHeader::SIZE),
+            partial_header: Vec::with_capacity(H::SIZE),
+            header: PhantomData,
         }
     }
 
@@ -40,20 +45,17 @@ impl TcpFraming {
         if self.has_pending_header() {
             0
         } else {
-            CommandHeader::SIZE - self.partial_header.len()
+            H::SIZE - self.partial_header.len()
         }
     }
 
     /// Appends received header bytes; once the header is complete, parses it and begins the body.
     pub fn push_header_bytes(&mut self, data: &[u8]) -> FrankaResult<()> {
         self.partial_header.extend_from_slice(data);
-        if self.partial_header.len() < CommandHeader::SIZE {
+        if self.partial_header.len() < H::SIZE {
             return Ok(());
         }
-        let header: [u8; CommandHeader::SIZE] = self.partial_header[..]
-            .try_into()
-            .expect("partial header holds exactly one header");
-        self.partial_header.clear();
+        let header = std::mem::take(&mut self.partial_header);
         self.set_header(&header)
     }
 
@@ -62,18 +64,15 @@ impl TcpFraming {
         matches!(self.state, FramingState::Reading { .. })
     }
 
-    /// Parse a header and begin accumulating the message body.
-    pub fn set_header(&mut self, header_bytes: &[u8; CommandHeader::SIZE]) -> FrankaResult<()> {
-        let header = unsafe { CommandHeader::from_bytes(header_bytes) };
-        let size = { header.size } as usize;
-        let command_id = { header.command_id };
+    /// Parse a header (exactly `H::SIZE` bytes) and begin accumulating the message body.
+    pub fn set_header(&mut self, header_bytes: &[u8]) -> FrankaResult<()> {
+        assert_eq!(header_bytes.len(), H::SIZE, "a header is exactly H::SIZE bytes");
+        let (command_id, size) = H::decode(header_bytes);
+        let size = size as usize;
 
-        if size < CommandHeader::SIZE {
+        if size < H::SIZE {
             return Err(FrankaError::Protocol {
-                message: format!(
-                    "TCP message size ({size}) is smaller than header ({})",
-                    CommandHeader::SIZE
-                ),
+                message: format!("TCP message size ({size}) is smaller than header ({})", H::SIZE),
             });
         }
 
@@ -141,10 +140,11 @@ impl TcpFraming {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::{gripper, robot::CommandHeader};
 
     #[test]
     fn framing_basic_message() {
-        let mut framing = TcpFraming::new();
+        let mut framing = TcpFraming::<CommandHeader>::new();
         assert!(!framing.has_pending_header());
 
         // Create a header: command=1, command_id=42, size=20 (12 header + 8 payload)
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn framing_header_only_message() {
-        let mut framing = TcpFraming::new();
+        let mut framing = TcpFraming::<CommandHeader>::new();
 
         // A message with size == header size (no payload)
         let header = CommandHeader {
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn framing_rejects_too_small_size() {
-        let mut framing = TcpFraming::new();
+        let mut framing = TcpFraming::<CommandHeader>::new();
 
         let header = CommandHeader {
             command: 0,
@@ -209,5 +209,23 @@ mod tests {
 
         let result = framing.set_header(&header_bytes);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn framing_gripper_header() {
+        let mut framing = TcpFraming::<gripper::CommandHeader>::new();
+        assert_eq!(framing.header_bytes_needed(), 10);
+
+        // Homing response: command=1, command_id=5, size=12 (10 header + 2 status), split in two reads.
+        let header = gripper::CommandHeader { command: 1, command_id: 5, size: 12 }.to_bytes();
+        framing.push_header_bytes(&header[..4]).unwrap();
+        assert_eq!(framing.header_bytes_needed(), 6);
+        framing.push_header_bytes(&header[4..]).unwrap();
+        assert_eq!(framing.remaining_bytes(), 2);
+
+        framing.push_bytes(&[0, 0]);
+        let (cmd_id, msg) = framing.take_message();
+        assert_eq!(cmd_id, 5);
+        assert_eq!(msg.len(), 12);
     }
 }
