@@ -2,7 +2,7 @@
 
 `model` computes frame poses, Jacobians, mass matrix, Coriolis and gravity terms from the robot's
 URDF, as libfranka's `Model` does (libfranka uses pinocchio on the same URDF). Outputs are compared
-with libfranka's and pinocchio's in `validation/data/model_cases.txt`.
+with libfranka's and pinocchio's in `tests/fixtures/model_cases.txt`.
 
 ```rust
 use franka_rs::model::{Model, RobotModel};

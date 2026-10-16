@@ -92,6 +92,28 @@ impl RigidBodyInertia {
         matrix
     }
 
+    /// Returns the inverse of [`RigidBodyInertia::spatial_matrix`], mapping a force `[linear; angular]`
+    /// to the acceleration `[linear; angular]` it gives this body when at rest.
+    ///
+    /// # Panics
+    /// Panics if the rotational inertia is singular, which no physical body has.
+    pub(crate) fn inverse_spatial_matrix(&self) -> Matrix6<f64> {
+        let inverse_rotational = self
+            .rotational_inertia
+            .try_inverse()
+            .expect("a physical body has an invertible rotational inertia");
+        let lever = self.center_of_mass.cross_matrix();
+        let lever_times_inverse = lever * inverse_rotational;
+        let mut matrix = Matrix6::zeros();
+        matrix
+            .fixed_view_mut::<3, 3>(0, 0)
+            .copy_from(&(Matrix3::identity() / self.mass - lever_times_inverse * lever));
+        matrix.fixed_view_mut::<3, 3>(0, 3).copy_from(&lever_times_inverse);
+        matrix.fixed_view_mut::<3, 3>(3, 0).copy_from(&(-inverse_rotational * lever));
+        matrix.fixed_view_mut::<3, 3>(3, 3).copy_from(&inverse_rotational);
+        matrix
+    }
+
     /// Returns pinocchio's `Inertia::variation(motion)`: the 6×6 matrix `motion×* I − I motion×`,
     /// the time derivative of this inertia when its frame moves with `motion`.
     pub(crate) fn variation(&self, motion: &SpatialMotion) -> Matrix6<f64> {
@@ -324,6 +346,14 @@ mod tests {
             momentum.angular.x, momentum.angular.y, momentum.angular.z,
         );
         assert!((body.spatial_matrix() * motion.to_vector() - expected).norm() < 1e-12);
+    }
+
+    /// The closed-form inverse spatial inertia inverts the spatial inertia.
+    #[test]
+    fn inverse_spatial_matrix_inverts_spatial_matrix() {
+        let body = asymmetric_body();
+        let product = body.spatial_matrix() * body.inverse_spatial_matrix();
+        assert!((product - Matrix6::identity()).norm() < 1e-12);
     }
 
     #[test]

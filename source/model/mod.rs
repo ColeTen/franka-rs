@@ -14,6 +14,7 @@ use nalgebra::{Isometry3, SMatrix, SVector, Vector3};
 pub use self::spatial::RigidBodyInertia;
 
 use self::chain::KinematicChain;
+use self::dynamics::MassMatrixInverseConstants;
 use crate::constants::NUM_JOINTS;
 use crate::errors::FrankaResult;
 use crate::robot_state::RobotState;
@@ -49,6 +50,9 @@ pub trait RobotModel {
     /// Returns the joint-space mass matrix, in kg·m².
     fn mass(&self, q: &JointVector, payload: &RigidBodyInertia) -> MassMatrix;
 
+    /// Returns the inverse of the joint-space mass matrix [`RobotModel::mass`], in 1/(kg·m²).
+    fn mass_matrix_inverse(&self, q: &JointVector, payload: &RigidBodyInertia) -> MassMatrix;
+
     /// Returns the Coriolis and centrifugal joint torques, in N·m.
     fn coriolis(&self, q: &JointVector, dq: &JointVector, payload: &RigidBodyInertia) -> JointVector;
 
@@ -81,6 +85,11 @@ pub trait RobotModel {
     /// Returns [`RobotModel::mass`] at the measured state with its configured total load.
     fn mass_from_state(&self, state: &RobotState) -> MassMatrix {
         self.mass(&JointVector::from(state.q), &state.total_load())
+    }
+
+    /// Returns [`RobotModel::mass_matrix_inverse`] at the measured state with its configured total load.
+    fn mass_matrix_inverse_from_state(&self, state: &RobotState) -> MassMatrix {
+        self.mass_matrix_inverse(&JointVector::from(state.q), &state.total_load())
     }
 
     /// Returns [`RobotModel::coriolis`] at the measured state with its configured total load.
@@ -118,6 +127,8 @@ fn configuration_from_state(state: &RobotState) -> (JointVector, Isometry3<f64>,
 pub struct Model {
     /// Joint geometry and link inertias.
     chain: KinematicChain,
+    /// Configuration-independent terms of the mass matrix inverse.
+    mass_inverse_constants: MassMatrixInverseConstants,
 }
 
 impl Model {
@@ -127,9 +138,14 @@ impl Model {
     /// # Errors
     /// Returns [`FrankaError::Model`](crate::errors::FrankaError::Model) if the URDF does not
     /// describe a serial arm of seven revolute joints ending in a `link8` flange.
+    ///
+    /// # Panics
+    /// Panics if a link has a singular rotational inertia, which no physical link has.
     pub fn from_urdf(urdf: &str) -> FrankaResult<Self> {
+        let chain = KinematicChain::from_urdf(urdf)?;
         Ok(Self {
-            chain: KinematicChain::from_urdf(urdf)?,
+            mass_inverse_constants: MassMatrixInverseConstants::new(&chain),
+            chain,
         })
     }
 }
@@ -149,6 +165,10 @@ impl RobotModel for Model {
 
     fn mass(&self, q: &JointVector, payload: &RigidBodyInertia) -> MassMatrix {
         dynamics::mass_matrix(&self.chain, payload, q)
+    }
+
+    fn mass_matrix_inverse(&self, q: &JointVector, payload: &RigidBodyInertia) -> MassMatrix {
+        dynamics::mass_matrix_inverse(&self.chain, &self.mass_inverse_constants, payload, q)
     }
 
     fn coriolis(&self, q: &JointVector, dq: &JointVector, payload: &RigidBodyInertia) -> JointVector {
