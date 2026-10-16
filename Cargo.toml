@@ -11,5 +11,12 @@ roxmltree = "0.21.1"
 socket2 = "0.6.5"
 thiserror = "2"
 
+[dev-dependencies]
+criterion = "=0.8.2"
+
 [lib]
 path = "source/lib.rs"
+
+[[bench]]
+name = "mass_matrix_inverse"
+harness = false

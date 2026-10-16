@@ -33,6 +33,7 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
+#include <pinocchio/algorithm/aba.hpp>
 #include <pinocchio/algorithm/rnea.hpp>
 #include <pinocchio/parsers/urdf.hpp>
 #if defined(__GNUC__)
@@ -127,6 +128,35 @@ static void emit_coriolis_matrix(const std::string& urdf,
   append(inputs, com);
   const Eigen::MatrixXd& c = data.C;  // column-major
   emit("coriolis_matrix", inputs, std::vector<double>(c.data(), c.data() + 49));
+}
+
+// Emits pinocchio's inverse joint-space mass matrix (computeMinverse), with the payload attached to
+// the last joint exactly as in emit_coriolis_matrix. libfranka does not expose the inverse, so
+// pinocchio is called directly on the same URDF.
+static void emit_mass_matrix_inverse(const std::string& urdf,
+                                     const std::array<double, 7>& q,
+                                     const std::array<double, 9>& inertia,
+                                     double mass,
+                                     const std::array<double, 3>& com) {
+  pinocchio::Model model;
+  pinocchio::urdf::buildModelFromXML(urdf, model);
+  const pinocchio::FrameIndex last_link = model.getFrameId("link8");
+  const pinocchio::JointIndex last_joint = model.frames[last_link].parentJoint;
+  const pinocchio::Inertia payload(mass, Eigen::Map<const Eigen::Vector3d>(com.data()),
+                                   Eigen::Map<const Eigen::Matrix3d>(inertia.data(), 3, 3));
+  model.inertias[last_joint] = model.inertias[last_joint] + model.frames[last_link].placement.act(payload);
+  pinocchio::Data data(model);
+  const Eigen::VectorXd q_eigen = Eigen::Map<const Eigen::VectorXd>(q.data(), 7);
+  pinocchio::computeMinverse(model, data, q_eigen);
+  // computeMinverse fills only the upper triangle.
+  Eigen::MatrixXd inverse = data.Minv;
+  inverse.triangularView<Eigen::StrictlyLower>() = inverse.transpose();
+  std::vector<double> inputs;
+  append(inputs, q);
+  append(inputs, inertia);
+  inputs.push_back(mass);
+  append(inputs, com);
+  emit("mass_matrix_inverse", inputs, std::vector<double>(inverse.data(), inverse.data() + 49));
 }
 
 int main(int argc, char** argv) {
@@ -230,6 +260,7 @@ int main(int argc, char** argv) {
                             Coriolis{q_moved, dq_mixed, hand},
                             Coriolis{q_moved, dq_mixed, hand_offdiag}}) {
     emit_coriolis_matrix(urdf, c.q, c.dq, c.load.inertia, c.load.mass, c.load.com);
+    emit_mass_matrix_inverse(urdf, c.q, c.load.inertia, c.load.mass, c.load.com);
   }
   // std::uniform_real_distribution is implementation-defined, so regenerating with another C++
   // standard library can produce different random cases; the committed data file is the reference.
@@ -248,6 +279,7 @@ int main(int argc, char** argv) {
     const double mass = 1.0 + unit(rng);
     const std::array<double, 3> com = {0.1 * unit(rng), 0.1 * unit(rng), 0.1 * unit(rng)};
     emit_coriolis_matrix(urdf, q, dq, inertia, mass, com);
+    emit_mass_matrix_inverse(urdf, q, inertia, mass, com);
   }
 
   return 0;

@@ -378,6 +378,54 @@ fn mass_derivative_minus_twice_coriolis_matrix_is_skew_symmetric() {
     }
 }
 
+/// The mass matrix inverse is symmetric up to rounding, relative to its size.
+#[test]
+fn mass_matrix_inverse_is_symmetric() {
+    let model = fr3_model();
+    for (q, _, payload) in coriolis_cases() {
+        // Entries (i, j) and (j, i) are computed separately, so rounding leaves a small asymmetry
+        // that grows with the size of the inverse.
+        let inverse = model.mass_matrix_inverse(&q, &payload);
+        let relative_asymmetry = (inverse - inverse.transpose()).norm() / inverse.norm();
+        assert!(relative_asymmetry < 1e-13, "relative asymmetry {relative_asymmetry:e}");
+    }
+}
+
+/// Asserts that `model`'s mass matrix inverse is both a left and a right inverse of its mass matrix.
+fn assert_mass_matrix_inverse_inverts_mass(model: &Model, q: &JointVector, payload: &RigidBodyInertia) {
+    let mass = model.mass(q, payload);
+    let inverse = model.mass_matrix_inverse(q, payload);
+    let right = (mass * inverse - MassMatrix::identity()).norm();
+    let left = (inverse * mass - MassMatrix::identity()).norm();
+    assert!(right < 1e-10, "M·M⁻¹ differs from identity by {right}");
+    assert!(left < 1e-10, "M⁻¹·M differs from identity by {left}");
+}
+
+/// The mass matrix inverse is a left and right inverse of the mass matrix on the FR3 model.
+#[test]
+fn mass_matrix_inverse_times_mass_is_identity() {
+    let model = fr3_model();
+    for (q, _, payload) in coriolis_cases() {
+        assert_mass_matrix_inverse_inverts_mass(&model, &q, &payload);
+    }
+}
+
+/// The mass matrix inverse stays correct when the joint axes are tilted or reversed, which
+/// exercises the alignment of each axis with z.
+#[test]
+fn mass_matrix_inverse_with_rotated_axis_is_inverse() {
+    let urdf = include_str!("../../external/libfranka/test/fr3.urdf");
+    let z_axis = r#"<axis xyz="0 0 1"/>"#;
+    assert_eq!(urdf.matches(z_axis).count(), NUM_JOINTS, "every joint axis must be replaced");
+    for axis in ["0.6 0 0.8", "0 0 -1"] {
+        let rotated = urdf.replace(z_axis, &format!(r#"<axis xyz="{axis}"/>"#));
+        let model = Model::from_urdf(&rotated).unwrap();
+        for (q, _, payload) in coriolis_cases() {
+            assert_mass_matrix_inverse_inverts_mass(&model, &q, &payload);
+        }
+    }
+}
+
 /// Model whose outputs are simple functions of its inputs, so tests can tell which inputs it received.
 struct EchoModel;
 
@@ -396,6 +444,11 @@ impl RobotModel for EchoModel {
 
     fn mass(&self, _q: &JointVector, payload: &RigidBodyInertia) -> MassMatrix {
         MassMatrix::from_element(payload.mass)
+    }
+
+    /// Returns a matrix filled with `q[0]` plus the payload mass, distinct from [`EchoModel::mass`].
+    fn mass_matrix_inverse(&self, q: &JointVector, payload: &RigidBodyInertia) -> MassMatrix {
+        MassMatrix::from_element(q[0] + payload.mass)
     }
 
     fn coriolis(&self, _q: &JointVector, dq: &JointVector, _payload: &RigidBodyInertia) -> JointVector {
@@ -429,6 +482,7 @@ fn from_state_methods_forward_state_fields() {
     assert_eq!(model.zero_jacobian_from_state(Frame::Flange, &state)[(0, 0)], 0.2);
     assert_eq!(model.body_jacobian_from_state(Frame::Flange, &state)[(0, 0)], 0.3);
     assert!((model.mass_from_state(&state)[(0, 0)] - 1.0).abs() < 1e-12);
+    assert!((model.mass_matrix_inverse_from_state(&state)[(0, 0)] - 1.1).abs() < 1e-12);
     assert_eq!(model.coriolis_from_state(&state), JointVector::from(state.dq));
     assert!((model.coriolis_matrix_from_state(&state) - CoriolisMatrix::from_diagonal(&JointVector::from(state.dq)) * 1.1).norm() < 1e-12);
     assert_eq!(model.gravity_from_state(&state)[0], -9.7);
@@ -488,6 +542,7 @@ fn model_matches_libfranka() {
 
     let mut cases = 0;
     let mut largest_coriolis_matrix_difference: f64 = 0.0;
+    let mut largest_mass_matrix_inverse_difference: f64 = 0.0;
     for line in text.lines() {
         let mut fields = line.split(' ');
         let tag = fields.next().expect("tag");
@@ -550,6 +605,17 @@ fn model_matches_libfranka() {
                 // Both evaluate the same algorithm, so agreement is at rounding level.
                 assert_close(actual.as_slice(), &v[27..76], 1e-12);
             }
+            "mass_matrix_inverse" => {
+                assert_eq!(v.len(), 69, "mass_matrix_inverse: field count");
+                let q = JointVector::from_column_slice(&v[0..7]);
+                let load = payload_from(v[16], &v[17..20], &v[7..16]);
+                let actual = model.mass_matrix_inverse(&q, &load);
+                let expected = MassMatrix::from_column_slice(&v[20..69]);
+                // Entries grow into the thousands for light distal links, so the bound is relative.
+                let relative = (actual - expected).norm() / expected.norm();
+                largest_mass_matrix_inverse_difference = largest_mass_matrix_inverse_difference.max(relative);
+                assert!(relative < 1e-12, "mass_matrix_inverse: relative difference {relative:e}");
+            }
             "gravity" => {
                 assert_eq!(v.len(), 21, "gravity: field count");
                 let q = JointVector::from_column_slice(&v[0..7]);
@@ -563,4 +629,5 @@ fn model_matches_libfranka() {
     }
     assert!(cases > 0, "no cases in {path}");
     eprintln!("largest |franka-rs - pinocchio| Coriolis matrix element: {largest_coriolis_matrix_difference:e}");
+    eprintln!("largest |franka-rs - pinocchio| mass matrix inverse (relative norm): {largest_mass_matrix_inverse_difference:e}");
 }
