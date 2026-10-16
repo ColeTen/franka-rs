@@ -349,14 +349,14 @@ mod tests {
 
     #[test]
     fn rejects_missing_flange() {
-        let urdf = include_str!("../../external/libfranka/test/fr3.urdf").replace("link8", "link9");
+        let urdf = include_str!("../../tests/fixtures/fr3_robot.urdf").replace("link8", "link9");
         let error = KinematicChain::from_urdf(&urdf).unwrap_err();
         assert!(error.to_string().contains("link8"), "{error}");
     }
 
     #[test]
     fn parses_fr3_geometry() {
-        let chain = KinematicChain::from_urdf(include_str!("../../external/libfranka/test/fr3.urdf")).unwrap();
+        let chain = KinematicChain::from_urdf(include_str!("../../tests/fixtures/fr3_robot.urdf")).unwrap();
         assert!((chain.joints[3].placement.translation.vector - Vector3::new(0.0825, 0.0, 0.0)).norm() < 1e-12);
         assert!((chain.joints[6].placement.translation.vector - Vector3::new(0.088, 0.0, 0.0)).norm() < 1e-12);
         assert!((chain.flange.translation.vector - Vector3::new(0.0, 0.0, 0.107)).norm() < 1e-12);

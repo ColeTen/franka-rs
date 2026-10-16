@@ -6,7 +6,7 @@
 // (franka::Model is backed by Pinocchio), so it is built with the libfranka CMake package inside
 // the devcontainer rather than natively. Build it via validation/reference/CMakeLists.txt, then:
 //
-//   ./model <path-to-urdf> > validation/data/model_cases.txt
+//   ./model <path-to-urdf> > tests/fixtures/model_cases.txt
 //
 // where <path-to-urdf> is the same file the franka-rs test loads (tests/fixtures/fr3_robot.urdf).
 //
